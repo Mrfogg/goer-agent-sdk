@@ -17,11 +17,14 @@ agent := base.NewBaseAgent(
 )
 agent.AddTool(aggregateTool{}) // regular tools the model may call along the way
 
-for msg := range agent.Run(ctx, "Summarize this sheet") {
-	if msg.Type == base.MsgTypeRunDone {
-		fmt.Println(msg.Content) // the content your finish tool returned
-	}
+stream, err := agent.Run(ctx, "Summarize this sheet")
+if err != nil {
+	panic(err)
 }
+for msg := range stream {
+	fmt.Print(msg.Content) // "reasoning" = thinking, "content" = answer text
+}
+fmt.Println("\nanswer:", agent.Result().Answer)
 ```
 
 ---
@@ -122,19 +125,28 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	for msg := range agent.Run(ctx, "How many rows does this sheet have?") {
+	stream, err := agent.Run(ctx, "How many rows does this sheet have?")
+	if err != nil {
+		panic(err)
+	}
+
+	for msg := range stream {
 		switch msg.Type {
 		case base.MsgTypeReasoning:
 			fmt.Print(msg.Content) // the model's thinking, streamed
 		case base.MsgTypeContent:
 			fmt.Print(msg.Content) // the answer text, streamed
-		case base.MsgTypeRunDone:
-			fmt.Println("\nanswer:", msg.Content)
-		case base.MsgTypeRunError:
-			fmt.Println("\nerror:", msg.Content)
-		case base.MsgTypeRunStopped:
-			fmt.Println("\nstopped:", msg.Content)
 		}
+	}
+
+	result := agent.Result()
+	switch {
+	case result.Err != nil:
+		fmt.Println("\nfailed:", result.Err)
+	case result.Stopped:
+		fmt.Println("\nstopped by the caller")
+	default:
+		fmt.Println("\nanswer:", result.Answer)
 	}
 }
 ```
@@ -143,7 +155,8 @@ What happens at runtime:
 
 1. the model replies with a tool call (`count_rows` or `finish`);
 2. regular tool results go back into the transcript and the loop continues;
-3. a successful `finish` ends the run: you get `markdown` with the answer, then `run_done`;
+3. a successful `finish` ends the run: the channel closes and `Result().Answer` holds the content
+   your end tool returned;
 4. if the model answers with prose only, the runtime sends it back with a corrective message.
 
 ---
@@ -272,11 +285,14 @@ Store `role`, `content`, `tool_calls` and `tool_call_id` verbatim — see the FA
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
-stream := agent.Run(ctx, userInput)
+stream, err := agent.Run(ctx, userInput)
+if err != nil {
+	return err
+}
 
 go func() {
 	for msg := range stream {
-		forward(msg) // your websocket / SSE writer
+		forward(msg) // "reasoning" or "content", your websocket / SSE writer
 	}
 	closeClientStream()
 }()
@@ -285,18 +301,18 @@ go func() {
 cancel() // or: agent.Stop()
 ```
 
-| Event | Meaning |
+| Message type | Meaning |
 | --- | --- |
-| `start` | the run began |
 | `reasoning` | the model's thinking (reasoning) text, streamed |
 | `content` | the answer text, streamed |
-| `heartbeat` | the run is alive (every second) |
-| `markdown` | the final answer text |
-| `run_done` / `run_error` / `run_stopped` | the run is over; the channel closes next |
+
+Those are the only two types the runtime ever emits. There is no heartbeat, no start marker and
+no terminal event: the channel simply closes, and `Result()` then tells you how the run ended.
 
 ### 8. Timeouts and cancellation
 
-Give the run a deadline; when it fires you get `run_stopped`, not `run_error`.
+Give the run a deadline; when it fires the run ends with `Result().Stopped` set (and `Err` is
+`context.DeadlineExceeded`).
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -360,18 +376,24 @@ agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
 ### 13. Persist a run
 
 ```go
-var msgs []base.Msg
-for msg := range agent.Run(ctx, input) {
-	msgs = append(msgs, msg)
-	forward(msg)
+stream, err := agent.Run(ctx, input)
+if err != nil {
+	return err
+}
+for msg := range stream {
+	forward(msg) // stream the model output to the user
 }
 
-summary := base.SummarizeMessages(msgs)
-db.SaveTurn(chatID, summary.Answer, summary.VisibleContent, agent.History())
+result := agent.Result()
+if result.Err != nil {
+	// handle the failure (Result().Stopped tells cancellation from error)
+}
+db.SaveTurn(chatID, result.Answer, agent.History())
 ```
 
-`summary.VisibleContent` is the markdown / task-completed / chart / stop text the user actually
-saw; `summary.HtmlContent` carries the dashboard payload when a run produced one.
+`result.Answer` is the end tool's final content; `agent.History()` is the full transcript for the
+next turn. Product-specific payloads (charts, dashboards) are whatever your tools emit through
+`Msg.Data` — the runtime does not aggregate them for you.
 
 ### 14. Use it inside an HTTP handler
 
@@ -383,14 +405,19 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	for msg := range agent.Run(ctx, r.FormValue("input")) {
+	stream, err := agent.Run(ctx, r.FormValue("input"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	for msg := range stream {
 		writeEvent(w, msg)
 	}
-	saveHistory(chatID, agent.History())
+	saveHistory(chatID, agent.Result().Answer, agent.History())
 }
 ```
 
-One instance handles one run. A concurrent second `Run` returns a `run_error` reading
+One instance handles one run. A concurrent second `Run` returns an error reading
 `agent is already running: one BaseAgent instance handles a single run at a time`.
 
 ---
@@ -404,8 +431,10 @@ One instance handles one run. A concurrent second `Run` returns a `run_error` re
 5. Tool calls queued behind an end tool in the same turn are recorded as "skipped" placeholders,
    so the transcript stays valid for the next request.
 6. LLM transport failures retry three times (500ms → 1s), then fail with the cause preserved.
-7. A panicking tool becomes a `run_error`; the process survives and the run slot is released.
-8. The channel closes after exactly one terminal event: `run_done`, `run_error` or `run_stopped`.
+7. A panicking tool is recovered into `Result().Err`; the process survives and the run slot is
+   released.
+8. The channel closes when the run ends. The outcome is only in `Result()`:
+   `Answer` on success, `Stopped` for cancellation, `Err` for failure.
 
 ### What the model actually receives
 
@@ -446,8 +475,9 @@ are skipped; at least one usable end tool is required.
 
 | Method | Description |
 | --- | --- |
-| `Run(ctx, input) chan Msg` | Start a run; drain the channel until it closes |
-| `Stop()` | Cancel the run (terminal event: `run_stopped`) |
+| `Run(ctx, input) (chan Msg, error)` | Start a run; the error reports a misuse such as a concurrent run |
+| `Result() RunResult` | The outcome of the finished run: `Answer`, `Stopped`, `Err` |
+| `Stop()` | Cancel the run (`Result().Stopped` becomes true) |
 | `WithHistory(history)` / `History()` | Seed / read the transcript (deep copies) |
 | `HasState()` | Whether history exists |
 | `AddTool(tool)` / `GetTool(name)` / `GetTools()` | Tool registry (`GetTools` returns a copy) |
@@ -480,6 +510,18 @@ type Msg struct {
 }
 
 type ToolEventEmitter func(Msg)
+
+// The two messages the runtime emits while a run is streaming.
+const (
+	MsgTypeReasoning = "reasoning" // the model's thinking text
+	MsgTypeContent   = "content"   // the answer text
+)
+
+type RunResult struct {
+	Answer  string // final content returned by the end tool
+	Stopped bool   // the run was cancelled (Stop, ctx cancel or deadline)
+	Err     error  // failure reason
+}
 ```
 
 ### Runtime defaults
@@ -492,7 +534,6 @@ type ToolEventEmitter func(Msg)
 | `noToolCallFailAfter` | 5 | Text-only replies before failing the run |
 | `llmMaxAttempts` | 3 | Attempts per LLM call |
 | `llmRetryBaseDelay` / `llmRetryMaxDelay` | 500ms / 5s | Backoff bounds |
-| `heartbeatInterval` | 1s | Heartbeat interval |
 | `eventChannelBuffer` | 256 | Buffer of the channel returned by `Run` |
 | `logContentMaxRunes` | 2000 | Log clipping length |
 
@@ -512,15 +553,16 @@ carries `chat_id=`, and model output, tool arguments and results are clipped.
 | Symptom | Cause and fix |
 | --- | --- |
 | `unknown field ExtraBody` / `ReasoningContent` at build time | The `replace` directive is missing — add it to your `go.mod` (see Installation). |
-| `run_error: llm call failed after 3 attempts (model=…)` | Wrong token, wrong base URL, or the gateway is down. The wrapped cause is in the message. |
-| `run_error: agent replied without calling a tool 5 times in a row` | The model keeps answering in prose. State explicitly that only `finish` ends the task, or make `finish` easier to call (fewer/simpler arguments). |
-| `run_error: agent execution exceeded max iterations (66)` | The task needs more turns than allowed, or a tool keeps failing. Raise `SetMaxIterations` or fix the tool. |
+| `Result().Err` = `llm call failed after 3 attempts (model=…)` | Wrong token, wrong base URL, or the gateway is down. The wrapped cause is in the message. |
+| `Result().Err` = `agent replied without calling a tool 5 times in a row` | The model keeps answering in prose. State explicitly that only `finish` ends the task, or make `finish` easier to call (fewer/simpler arguments). |
+| `Result().Err` = `agent execution exceeded max iterations (66)` | The task needs more turns than allowed, or a tool keeps failing. Raise `SetMaxIterations` or fix the tool. |
 | HTTP 400 when continuing a conversation | Stored history has an assistant `tool_calls` entry without matching tool results. Persist `tool_call_id` verbatim for every tool message. |
 | The run never finishes | No end tool is registered, or its name does not match what the model calls. Check `agent.EndToolNames()`. |
 | The model's own final text is missing from the answer | Only the end tool's `ModelContent` becomes the answer. Make `finish` return the text you want to show; the runtime falls back to the last assistant text only when it is empty. |
 | A tool result looks truncated | It exceeded `WithToolResultMaxBytes`: the payload is replaced by a clipped one with `"truncated": true`. Raise the cap or shrink the tool output. |
-| Concurrency errors under load | One agent instance = one run. Build a new instance per request (recipe 14). |
+| `Run` returns `agent is already running` | One agent instance = one run. Build a new instance per request (recipe 14). |
 | Answers come back in the wrong language | Set `WithLang("zh-CN")` — the language is only controlled by this option. |
+| Nothing shows up while the model is thinking | Only `reasoning` and `content` messages are emitted; if the model returns plain text without reasoning there is no early output, and the final answer only appears in `Result().Answer`. |
 
 ---
 
@@ -545,8 +587,6 @@ same checks on `main` and on pull requests.
 1. The fork dependency (see Installation) must be repeated by every consumer.
 2. The runtime does not trim the transcript — long conversations need your own strategy
    (recipe 12).
-3. `attachment.go` holds product-specific chart/dashboard conventions; ignore it if your product
-   does not use them.
 
 ## Relationship to the backend copy
 

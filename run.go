@@ -13,24 +13,39 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-// Run starts one agent turn and returns the channel of run events. The channel is
-// closed after the terminal event: run_done, run_error or run_stopped.
+// RunResult is the outcome of a run. It is available through Result after the
+// channel returned by Run has been closed.
+type RunResult struct {
+	// Answer is the final content the end tool returned.
+	Answer string
+	// Stopped reports that the run was cancelled: Stop was called, the context was
+	// cancelled, or its deadline expired.
+	Stopped bool
+	// Err is the failure reason when the run did not finish on its own.
+	Err error
+}
+
+// Run starts one agent turn.
 //
-// A BaseAgent owns per-run state, so it handles one run at a time. Calling Run
-// while a run is active returns a channel carrying a run_error.
+// The returned channel carries the model output as it streams: MsgTypeReasoning
+// messages for the model's thinking and MsgTypeContent messages for the answer
+// text. It is closed when the run ends; read the outcome (final answer, failure
+// or cancellation) from Result afterwards.
 //
-// The caller is expected to drain the channel until it is closed. Event delivery
-// is cancellable, so abandoning the channel cannot block the run goroutine
-// forever.
-func (a *BaseAgent) Run(ctx context.Context, input string) chan Msg {
+// The error is about the call, not the run: the only case today is calling Run
+// while another run is still active, because a BaseAgent owns per-run state and
+// therefore handles one run at a time.
+//
+// Drain the channel, or cancel the context (Stop does this) when you stop
+// reading: message delivery is bound to the run context.
+func (a *BaseAgent) Run(ctx context.Context, input string) (chan Msg, error) {
 	if !a.beginRun() {
-		return rejectedRunChannel()
+		return nil, errors.New("agent is already running: one BaseAgent instance handles a single run at a time")
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	msgChan := make(chan Msg, eventChannelBuffer)
 	emit := func(event Msg) { dispatchToolEvent(ctx, msgChan, event) }
-	emitFinal := func(event Msg) { dispatchFinalEvent(msgChan, event) }
 
 	a.runMu.Lock()
 	a.cancelFunc = cancel
@@ -41,60 +56,41 @@ func (a *BaseAgent) Run(ctx context.Context, input string) chan Msg {
 	}
 
 	go func() {
-		// Deferred order matters: close(msgChan) runs last, so a panic can still
-		// deliver a terminal event, and the run slot is always released.
 		defer close(msgChan)
+		var result RunResult
 		defer func() {
-			a.finishRun()
 			if recovered := recover(); recovered != nil {
 				agentLogError(ctx, "run panicked: %v\n%s", recovered, debug.Stack())
-				emitFinal(Msg{
-					Type:    MsgTypeRunError,
-					Content: fmt.Sprintf("agent run panicked: %v", recovered),
-				})
+				result = RunResult{Err: fmt.Errorf("agent run panicked: %v", recovered)}
 			}
+			a.finishRun(result)
 		}()
-
-		stopHeartbeat := a.startRunHeartbeat(ctx, msgChan)
-		defer stopHeartbeat()
 
 		xlog.Info("start run with tools: agent=%s", a.Name())
 		answer, err := a.runWithTools(ctx, input, emit)
-		if err != nil {
-			if isRunStopped(err) || ctx.Err() != nil {
-				agentLogInfo(ctx, "run stopped: %v", err)
-				emitFinal(Msg{
-					Type:    MsgTypeRunStopped,
-					Content: stopMessage(a.Lang()),
-					Data: map[string]any{
-						"reason": err.Error(),
-					},
-				})
-				return
-			}
-
+		switch {
+		case err == nil:
+			result = RunResult{Answer: answer}
+		case isRunStopped(err) || ctx.Err() != nil:
+			agentLogInfo(ctx, "run stopped: %v", err)
+			result = RunResult{Stopped: true, Err: err}
+		default:
 			agentLogError(ctx, "run with tools failed: %v", err)
-			emitFinal(Msg{
-				Type:    MsgTypeRunError,
-				Content: err.Error(),
-			})
-			return
+			result = RunResult{Err: err}
 		}
-
-		emitFinal(Msg{
-			Type:    MsgTypeRunDone,
-			Content: answer,
-			Data: map[string]any{
-				"answer": answer,
-			},
-		})
 	}()
 
-	return msgChan
+	return msgChan, nil
 }
 
-// Stop cancels the running turn. The run emits a run_stopped terminal event, so
-// callers do not need to emit a separate user-facing stop message.
+// Result returns the outcome of the most recent finished run.
+func (a *BaseAgent) Result() RunResult {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	return a.runResult
+}
+
+// Stop cancels the running turn. The run ends with RunResult.Stopped set.
 func (a *BaseAgent) Stop() {
 	a.runMu.Lock()
 	cancel := a.cancelFunc
@@ -118,22 +114,12 @@ func (a *BaseAgent) beginRun() bool {
 	return true
 }
 
-func (a *BaseAgent) finishRun() {
+func (a *BaseAgent) finishRun(result RunResult) {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 	a.running = false
 	a.cancelFunc = nil
-}
-
-// rejectedRunChannel reports a misused Run call without starting a goroutine.
-func rejectedRunChannel() chan Msg {
-	msgChan := make(chan Msg, 1)
-	msgChan <- Msg{
-		Type:    MsgTypeRunError,
-		Content: "agent is already running: one BaseAgent instance handles a single run at a time",
-	}
-	close(msgChan)
-	return msgChan
+	a.runResult = result
 }
 
 // runWithTools drives the tool-calling loop: every iteration is one assistant
@@ -149,7 +135,6 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 		Content: strings.TrimSpace(input),
 		Name:    "original_user_request",
 	})
-	emit(Msg{Type: MsgTypeStart})
 	xlog.Info("user query: %s", input)
 
 	a.runMu.Lock()
@@ -249,9 +234,10 @@ func (a *BaseAgent) handleNoToolCalls(ctx context.Context) {
 	})
 }
 
-// finalizeRun emits the answer an end tool produced. Validating the answer is the
-// end tool's job: it either returns success with the final content, or it fails
-// and the run keeps going. The only thing left here is the optional plan module.
+// finalizeRun returns the answer an end tool produced. Validating the answer is
+// the end tool's job: it either returns success with the final content, or it
+// fails and the run keeps going. The only thing left here is the optional plan
+// module.
 func (a *BaseAgent) finalizeRun(ctx context.Context, answer string, emit ToolEventEmitter, iterations int, endReason string) string {
 	answer = strings.TrimSpace(answer)
 	if a.planModule != nil {
@@ -264,10 +250,6 @@ func (a *BaseAgent) finalizeRun(ctx context.Context, answer string, emit ToolEve
 		}
 	}
 
-	emit(Msg{
-		Type:    MsgTypeMarkdown,
-		Content: answer,
-	})
 	agentLogInfo(ctx, "agent ended with %s: iterations=%d", endReason, iterations)
 	return answer
 }

@@ -21,7 +21,7 @@ import (
 type Agent interface {
 	Name() string
 	Description() string
-	Run(ctx context.Context, input string) chan Msg
+	Run(ctx context.Context, input string) (chan Msg, error)
 }
 
 // AgentContextSnapshot is a serializable view of an agent's conversation state,
@@ -60,6 +60,7 @@ type BaseAgent struct {
 	// Per-run state, guarded by runMu.
 	runMu        sync.Mutex
 	running      bool
+	runResult    RunResult
 	agentHistory []openai.ChatCompletionMessage
 	cancelFunc   context.CancelFunc
 	memoryBlock  string

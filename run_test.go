@@ -2,6 +2,7 @@ package base
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,14 +13,13 @@ func TestRunFinishesThroughEndTool(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	msgs := collectRun(t, agent, "make a report")
+	msgs, result := collectRun(t, agent, "make a report")
 
-	done, ok := lastMessageOfType(msgs, MsgTypeRunDone)
-	if !ok {
-		t.Fatalf("expected run_done, got %v", msgTypes(msgs))
+	if result.Err != nil || result.Stopped {
+		t.Fatalf("run outcome = %+v (messages: %v)", result, msgTypes(msgs))
 	}
-	if done.Content != "final answer" {
-		t.Fatalf("answer = %q, want %q", done.Content, "final answer")
+	if result.Answer != "final answer" {
+		t.Fatalf("answer = %q, want %q", result.Answer, "final answer")
 	}
 	if llm.requestCount() != 1 {
 		t.Fatalf("llm calls = %d, want 1", llm.requestCount())
@@ -31,10 +31,46 @@ func TestRunFinishesThroughEndTool(t *testing.T) {
 	if system := firstSystemMessage(first.messages); !strings.Contains(system, "END-TOOL MODE") {
 		t.Fatalf("system prompt missing end-tool mode:\n%s", system)
 	}
+	if _, ok := toolMessageByID(agent.History(), "call_1"); !ok {
+		t.Fatalf("missing tool result for call_1: %s", describeHistory(agent.History()))
+	}
+}
 
-	history := agent.History()
-	if _, ok := toolMessageByID(history, "call_1"); !ok {
-		t.Fatalf("missing tool result for call_1: %s", describeHistory(history))
+func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
+	llm := newFakeLLM(
+		sseReasoning(t, "let me think about it"),
+		sseText(t, "the answer is 42"),
+		sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
+	)
+	server := llm.start(t)
+	agent := startAgent(t, server)
+
+	msgs, result := collectRun(t, agent, "hi")
+
+	if result.Err != nil {
+		t.Fatalf("run failed: %v", result.Err)
+	}
+	for _, msg := range msgs {
+		if msg.Type != MsgTypeReasoning && msg.Type != MsgTypeContent {
+			t.Fatalf("unexpected message type %q in %v", msg.Type, msgTypes(msgs))
+		}
+	}
+
+	reasoning, ok := lastMessageOfType(msgs, MsgTypeReasoning)
+	if !ok || reasoning.Content != "let me think about it" {
+		t.Fatalf("reasoning message = %+v (messages: %v)", reasoning, msgTypes(msgs))
+	}
+	content, ok := lastMessageOfType(msgs, MsgTypeContent)
+	if !ok || content.Content != "the answer is 42" {
+		t.Fatalf("content message = %+v (messages: %v)", content, msgTypes(msgs))
+	}
+	for _, msg := range msgs {
+		if msg.Type == MsgTypeContent && strings.Contains(msg.Content, "think") {
+			t.Fatalf("reasoning text leaked into the content stream: %q", msg.Content)
+		}
+		if msg.Type == MsgTypeReasoning && strings.Contains(msg.Content, "42") {
+			t.Fatalf("answer text leaked into the reasoning stream: %q", msg.Content)
+		}
 	}
 }
 
@@ -46,10 +82,10 @@ func TestTextOnlyReplyIsRejectedAndRetried(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	msgs := collectRun(t, agent, "hi")
+	_, result := collectRun(t, agent, "hi")
 
-	if _, ok := lastMessageOfType(msgs, MsgTypeRunDone); !ok {
-		t.Fatalf("expected run_done, got %v", msgTypes(msgs))
+	if result.Err != nil || result.Answer != "final answer" {
+		t.Fatalf("run outcome = %+v", result)
 	}
 	if llm.requestCount() != 2 {
 		t.Fatalf("llm calls = %d, want 2", llm.requestCount())
@@ -63,35 +99,6 @@ func TestTextOnlyReplyIsRejectedAndRetried(t *testing.T) {
 	}
 }
 
-func TestReasoningAndContentDeltasAreSeparated(t *testing.T) {
-	llm := newFakeLLM(
-		sseReasoning(t, "let me think about it"),
-		sseText(t, "the answer is 42"),
-		sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
-	)
-	server := llm.start(t)
-	agent := startAgent(t, server)
-
-	msgs := collectRun(t, agent, "hi")
-
-	reasoning, ok := lastMessageOfType(msgs, MsgTypeReasoning)
-	if !ok || reasoning.Content != "let me think about it" {
-		t.Fatalf("reasoning event = %+v (events: %v)", reasoning, msgTypes(msgs))
-	}
-	content, ok := lastMessageOfType(msgs, MsgTypeContent)
-	if !ok || content.Content != "the answer is 42" {
-		t.Fatalf("content event = %+v (events: %v)", content, msgTypes(msgs))
-	}
-	for _, msg := range msgs {
-		if msg.Type == MsgTypeContent && strings.Contains(msg.Content, "think") {
-			t.Fatalf("reasoning text leaked into the content stream: %q", msg.Content)
-		}
-		if msg.Type == MsgTypeReasoning && strings.Contains(msg.Content, "42") {
-			t.Fatalf("answer text leaked into the reasoning stream: %q", msg.Content)
-		}
-	}
-}
-
 func TestRepeatedTextOnlyRepliesEscalateAndFail(t *testing.T) {
 	llm := newFakeLLM(
 		sseText(t, "one"), sseText(t, "two"), sseText(t, "three"),
@@ -100,14 +107,13 @@ func TestRepeatedTextOnlyRepliesEscalateAndFail(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	msgs := collectRun(t, agent, "hi")
+	_, result := collectRun(t, agent, "hi")
 
-	runErr, ok := lastMessageOfType(msgs, MsgTypeRunError)
-	if !ok {
-		t.Fatalf("expected run_error, got %v", msgTypes(msgs))
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "without calling a tool") {
+		t.Fatalf("run outcome = %+v", result)
 	}
-	if !strings.Contains(runErr.Content, "without calling a tool") {
-		t.Fatalf("unexpected error: %q", runErr.Content)
+	if result.Stopped {
+		t.Fatalf("a stuck model is a failure, not a cancellation: %+v", result)
 	}
 	if got := llm.requestAt(t, 2).toolChoice; got != "required" {
 		t.Fatalf("tool_choice on the 3rd call = %v, want required", got)
@@ -135,17 +141,15 @@ func TestFailedEndToolDoesNotFinishRun(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server, finish)
 
-	msgs := collectRun(t, agent, "hi")
+	_, result := collectRun(t, agent, "hi")
 
-	done, ok := lastMessageOfType(msgs, MsgTypeRunDone)
-	if !ok || done.Content != "final answer" {
-		t.Fatalf("expected the run to continue after a failed end tool, got %v", msgTypes(msgs))
+	if result.Err != nil || result.Answer != "final answer" {
+		t.Fatalf("expected the run to continue after a failed end tool, got %+v", result)
 	}
 	if llm.requestCount() != 2 {
 		t.Fatalf("llm calls = %d, want 2", llm.requestCount())
 	}
-	history := agent.History()
-	failed, ok := toolMessageByID(history, "call_1")
+	failed, ok := toolMessageByID(agent.History(), "call_1")
 	if !ok || !strings.Contains(failed.Content, "not ready") {
 		t.Fatalf("failed end tool result missing: %+v", failed)
 	}
@@ -159,10 +163,10 @@ func TestSkippedToolCallsAreRecorded(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server, newStubTool("finish", "final answer"), newStubTool("regular", "regular result"))
 
-	msgs := collectRun(t, agent, "hi")
+	_, result := collectRun(t, agent, "hi")
 
-	if _, ok := lastMessageOfType(msgs, MsgTypeRunDone); !ok {
-		t.Fatalf("expected run_done, got %v", msgTypes(msgs))
+	if result.Err != nil {
+		t.Fatalf("run failed: %v", result.Err)
 	}
 	history := agent.History()
 	endResult, ok := toolMessageByID(history, "call_end")
@@ -178,30 +182,32 @@ func TestSkippedToolCallsAreRecorded(t *testing.T) {
 	}
 }
 
-func TestStopEmitsRunStopped(t *testing.T) {
+func TestStopMarksRunStopped(t *testing.T) {
 	llm := newFakeLLM(fakeLLMBlock)
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	stream := agent.Run(context.Background(), "hi")
-	waitForEvent(t, stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // unblocks the fake LLM even when the test fails early
+
+	stream := startStream(t, agent, ctx, "hi")
+	waitForRequest(t, llm, 1)
 	agent.Stop()
+	drain(t, stream)
 
-	msgs := drain(t, stream)
-
-	stopped, ok := lastMessageOfType(msgs, MsgTypeRunStopped)
-	if !ok {
-		t.Fatalf("expected run_stopped, got %v", msgTypes(msgs))
+	result := agent.Result()
+	if !result.Stopped {
+		t.Fatalf("run outcome = %+v, want Stopped", result)
 	}
-	if stopped.Content != "You have stopped the query" {
-		t.Fatalf("stop message = %q", stopped.Content)
+	if !errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("stop reason = %v, want context.Canceled", result.Err)
 	}
-	if _, ok := lastMessageOfType(msgs, MsgTypeRunDone); ok {
-		t.Fatal("a stopped run must not report run_done")
+	if result.Answer != "" {
+		t.Fatalf("a stopped run must not produce an answer, got %q", result.Answer)
 	}
 }
 
-func TestToolPanicBecomesRunError(t *testing.T) {
+func TestToolPanicIsReportedAsFailure(t *testing.T) {
 	boom := &stubTool{
 		name: "finish",
 		execute: func(ctx context.Context, args map[string]any) (ToolResult, error) {
@@ -212,21 +218,20 @@ func TestToolPanicBecomesRunError(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server, boom)
 
-	msgs := collectRun(t, agent, "hi")
+	msgs, result := collectRun(t, agent, "hi")
 
-	runErr, ok := lastMessageOfType(msgs, MsgTypeRunError)
-	if !ok {
-		t.Fatalf("expected run_error, got %v", msgTypes(msgs))
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "panicked") {
+		t.Fatalf("run outcome = %+v (messages: %v)", result, msgTypes(msgs))
 	}
-	if !strings.Contains(runErr.Content, "panicked") {
-		t.Fatalf("unexpected error: %q", runErr.Content)
+	if result.Stopped {
+		t.Fatalf("a panic is a failure, not a cancellation: %+v", result)
 	}
 
 	// The run slot must be released so the agent can be reused.
 	if !agent.beginRun() {
 		t.Fatal("run slot was not released after a recovered panic")
 	}
-	agent.finishRun()
+	agent.finishRun(RunResult{})
 }
 
 func TestLLMFailureIsRetriedAndReported(t *testing.T) {
@@ -234,14 +239,10 @@ func TestLLMFailureIsRetriedAndReported(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	msgs := collectRun(t, agent, "hi")
+	_, result := collectRun(t, agent, "hi")
 
-	runErr, ok := lastMessageOfType(msgs, MsgTypeRunError)
-	if !ok {
-		t.Fatalf("expected run_error, got %v", msgTypes(msgs))
-	}
-	if !strings.Contains(runErr.Content, "llm call failed after 3 attempts") {
-		t.Fatalf("unexpected error: %q", runErr.Content)
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "llm call failed after 3 attempts") {
+		t.Fatalf("run outcome = %+v", result)
 	}
 	if llm.requestCount() != llmMaxAttempts {
 		t.Fatalf("llm attempts = %d, want %d", llm.requestCount(), llmMaxAttempts)
@@ -253,13 +254,14 @@ func TestConcurrentRunIsRejected(t *testing.T) {
 	server := llm.start(t)
 	agent := startAgent(t, server)
 
-	first := agent.Run(context.Background(), "hi")
-	waitForEvent(t, first)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // unblocks the fake LLM even when the test fails early
 
-	second := drain(t, agent.Run(context.Background(), "again"))
-	runErr, ok := lastMessageOfType(second, MsgTypeRunError)
-	if !ok || !strings.Contains(runErr.Content, "already running") {
-		t.Fatalf("second run = %v", msgTypes(second))
+	first := startStream(t, agent, ctx, "hi")
+	waitForRequest(t, llm, 1)
+
+	if _, err := agent.Run(context.Background(), "again"); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("second run error = %v", err)
 	}
 
 	agent.Stop()
@@ -285,23 +287,22 @@ func TestToolResultTruncationKeepsRunWorking(t *testing.T) {
 	agent := startAgent(t, server, &stubTool{name: "finish", result: ToolResult{Success: true, ModelContent: big}}).
 		WithToolResultMaxBytes(1024)
 
-	msgs := collectRun(t, agent, "hi")
+	_, outcome := collectRun(t, agent, "hi")
 
-	done, ok := lastMessageOfType(msgs, MsgTypeRunDone)
-	if !ok {
-		t.Fatalf("expected run_done, got %v", msgTypes(msgs))
+	if outcome.Err != nil {
+		t.Fatalf("run failed: %v", outcome.Err)
 	}
-	if done.Content != big {
+	if outcome.Answer != big {
 		t.Fatal("the final answer must keep the full end-tool content")
 	}
-	result, ok := toolMessageByID(agent.History(), "call_1")
+	toolMessage, ok := toolMessageByID(agent.History(), "call_1")
 	if !ok {
 		t.Fatal("missing tool result")
 	}
-	if len(result.Content) > 1024 {
-		t.Fatalf("tool result = %d bytes, want <= 1024", len(result.Content))
+	if len(toolMessage.Content) > 1024 {
+		t.Fatalf("tool result = %d bytes, want <= 1024", len(toolMessage.Content))
 	}
-	if !strings.Contains(result.Content, "truncated") {
-		t.Fatalf("tool result was not marked as truncated: %q", result.Content)
+	if !strings.Contains(toolMessage.Content, "truncated") {
+		t.Fatalf("tool result was not marked as truncated: %q", toolMessage.Content)
 	}
 }

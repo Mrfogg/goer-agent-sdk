@@ -47,27 +47,13 @@ type Msg struct {
 type ToolEventEmitter func(Msg)
 
 const (
-	// MsgTypeReasoning and MsgTypeContent carry the streamed deltas of an
-	// assistant turn, kept apart so a frontend can render thinking separately:
-	// MsgTypeReasoning is the model's reasoning (thinking) text, MsgTypeContent is
-	// the answer text. Both carry the text accumulated so far, not just the last
-	// fragment.
+	// MsgTypeReasoning and MsgTypeContent are the only two message types the
+	// runtime emits. They carry the streamed deltas of an assistant turn, kept
+	// apart so a frontend can render thinking separately: MsgTypeReasoning is the
+	// model's reasoning (thinking) text, MsgTypeContent is the answer text. Both
+	// carry the text accumulated so far, not just the last fragment.
 	MsgTypeReasoning = "reasoning"
 	MsgTypeContent   = "content"
-
-	// MsgTypeMarkdown carries the final answer once the run is finished.
-	MsgTypeMarkdown = "markdown"
-
-	MsgTypeHeartbeat     = "heartbeat"
-	MsgTypeChartResult   = "chart_result"
-	MsgTypeDashboardHTML = "dashboard_html"
-	MsgTypeStart         = "start"
-	MsgTypeTaskCompleted = "task_completed"
-	MsgTypeReportStart   = "report_start"
-	MsgTypeReportEnd     = "report_end"
-	MsgTypeRunDone       = "run_done"
-	MsgTypeRunError      = "run_error"
-	MsgTypeRunStopped    = "run_stopped"
 )
 
 func OpenAIToolDefinition(tool Tool) openai.Tool {

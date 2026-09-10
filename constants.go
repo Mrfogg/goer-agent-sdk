@@ -12,14 +12,6 @@ const (
 	// eventChannelBuffer is the buffer size of the channel returned by Run.
 	eventChannelBuffer = 256
 
-	// finalEventDeliveryTimeout bounds how long a terminal event (run_done,
-	// run_error, run_stopped) may block when the consumer stopped reading the run
-	// channel.
-	finalEventDeliveryTimeout = 5 * time.Second
-
-	// heartbeatInterval is how often a heartbeat event is emitted during a run.
-	heartbeatInterval = 1 * time.Second
-
 	// logContentMaxRunes caps how much model, tool and argument content is written
 	// to logs.
 	logContentMaxRunes = 2000

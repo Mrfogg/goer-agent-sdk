@@ -15,11 +15,14 @@ agent := base.NewBaseAgent(
 )
 agent.AddTool(aggregateTool{}) // 过程中可以调的普通工具
 
-for msg := range agent.Run(ctx, "帮我总结这张表") {
-	if msg.Type == base.MsgTypeRunDone {
-		fmt.Println(msg.Content) // 就是 finish 工具返回的内容
-	}
+stream, err := agent.Run(ctx, "帮我总结这张表")
+if err != nil {
+	panic(err)
 }
+for msg := range stream {
+	fmt.Print(msg.Content) // "reasoning" 是思考，"content" 是正文
+}
+fmt.Println("\nanswer:", agent.Result().Answer)
 ```
 
 ---
@@ -117,19 +120,28 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	for msg := range agent.Run(ctx, "这张表有多少行？") {
+	stream, err := agent.Run(ctx, "这张表有多少行？")
+	if err != nil {
+		panic(err)
+	}
+
+	for msg := range stream {
 		switch msg.Type {
 		case base.MsgTypeReasoning:
 			fmt.Print(msg.Content) // 模型的思考内容，流式
 		case base.MsgTypeContent:
 			fmt.Print(msg.Content) // 回答正文，流式
-		case base.MsgTypeRunDone:
-			fmt.Println("\nanswer:", msg.Content)
-		case base.MsgTypeRunError:
-			fmt.Println("\nerror:", msg.Content)
-		case base.MsgTypeRunStopped:
-			fmt.Println("\nstopped:", msg.Content)
 		}
+	}
+
+	result := agent.Result()
+	switch {
+	case result.Err != nil:
+		fmt.Println("\nfailed:", result.Err)
+	case result.Stopped:
+		fmt.Println("\nstopped by the caller")
+	default:
+		fmt.Println("\nanswer:", result.Answer)
 	}
 }
 ```
@@ -138,7 +150,7 @@ func main() {
 
 1. 模型返回工具调用（`count_rows` 或 `finish`）；
 2. 普通工具的结果写回 transcript，循环继续；
-3. `finish` 成功 → 先发 `markdown`（最终答案），再发 `run_done`；
+3. `finish` 成功 → channel 关闭，最终答案在 `Result().Answer` 里（就是 end tool 返回的内容）；
 4. 如果模型只回了一段话、没调工具，运行时会把它退回并附上纠正提示。
 
 ---
@@ -264,11 +276,14 @@ saveHistory(chatID, agent.History()) // 返回副本，可以放心留存
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
-stream := agent.Run(ctx, userInput)
+stream, err := agent.Run(ctx, userInput)
+if err != nil {
+	return err
+}
 
 go func() {
 	for msg := range stream {
-		forward(msg) // 你的 websocket / SSE 写出
+		forward(msg) // "reasoning" 或 "content"，你的 websocket / SSE 写出
 	}
 	closeClientStream()
 }()
@@ -277,18 +292,18 @@ go func() {
 cancel() // 或者 agent.Stop()
 ```
 
-| 你会收到的事件 | 含义 |
+| 消息类型 | 含义 |
 | --- | --- |
-| `start` | run 开始 |
 | `reasoning` | 模型的思考（推理）内容，流式吐出 |
 | `content` | 回答正文，流式吐出 |
-| `heartbeat` | 每秒一次，说明 run 还活着 |
-| `markdown` | 最终答案文本 |
-| `run_done` / `run_error` / `run_stopped` | run 结束，随后 channel 关闭 |
+
+运行时只会发这两种消息：没有心跳、没有开始标记、也没有终态事件——channel 关闭即 run 结束，
+之后用 `Result()` 拿结果。
 
 ### 8. 超时与取消
 
-给 run 一个 deadline，超时收到的是 `run_stopped`（不是 `run_error`）。
+给 run 一个 deadline；超时后 `Result().Stopped` 为 true，`Result().Err` 是
+`context.DeadlineExceeded`。
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -350,18 +365,23 @@ agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
 ### 13. 把一次 run 入库
 
 ```go
-var msgs []base.Msg
-for msg := range agent.Run(ctx, input) {
-	msgs = append(msgs, msg)
-	forward(msg)
+stream, err := agent.Run(ctx, input)
+if err != nil {
+	return err
+}
+for msg := range stream {
+	forward(msg) // 把模型输出实时转发给用户
 }
 
-summary := base.SummarizeMessages(msgs)
-db.SaveTurn(chatID, summary.Answer, summary.VisibleContent, agent.History())
+result := agent.Result()
+if result.Err != nil {
+	// 处理失败（Result().Stopped 用来区分「被取消」还是「出错」）
+}
+db.SaveTurn(chatID, result.Answer, agent.History())
 ```
 
-`summary.VisibleContent` 是用户实际看到的可见内容（markdown / task_completed / chart 附件 / 停止文案）；
-`summary.HtmlContent` 是 dashboard 输出（如果有）。
+`result.Answer` 是 end tool 给出的最终内容；`agent.History()` 是完整 transcript，供下一轮使用。
+产品侧的负载（图表、dashboard）由工具自己通过 `Msg.Data` 抛出，运行时不替你聚合。
 
 ### 14. 在 HTTP handler 里使用
 
@@ -373,15 +393,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	for msg := range agent.Run(ctx, r.FormValue("input")) {
+	stream, err := agent.Run(ctx, r.FormValue("input"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	for msg := range stream {
 		writeEvent(w, msg)
 	}
-	saveHistory(chatID, agent.History())
+	saveHistory(chatID, agent.Result().Answer, agent.History())
 }
 ```
 
 一个实例一次只跑一个 run。并发调用第二个 `Run` 会拿到一条
-`agent is already running: one BaseAgent instance handles a single run at a time` 的 `run_error`。
+`agent is already running: one BaseAgent instance handles a single run at a time` 的 error。
 
 ---
 
@@ -392,9 +417,9 @@ func handle(w http.ResponseWriter, r *http.Request) {
 3. end tool 返回 `Success=false` 或 error 都不结束 run。
 4. 连续 2 次纯文本回答 → 下一次请求强制 `tool_choice=required`；连续 5 次 → run 失败。
 5. 同一轮里排在 end tool 之后的工具调用会写成「已跳过」占位，保证 transcript 合法。
-6. LLM 传输失败退避重试 3 次（500ms → 1s），失败原因保留在 `run_error` 里。
-7. 工具 panic 会被兜成 `run_error`，进程不受影响，run 槽位一定释放。
-8. channel 在**唯一一个**终态事件（`run_done` / `run_error` / `run_stopped`）之后关闭。
+6. LLM 传输失败退避重试 3 次（500ms → 1s），失败原因保留在 `Result().Err` 里。
+7. 工具 panic 会被兜进 `Result().Err`，进程不受影响，run 槽位一定释放。
+8. run 结束时 channel 关闭，结果只在 `Result()` 里：成功看 `Answer`，被取消看 `Stopped`，失败看 `Err`。
 
 ### 模型实际收到的消息
 
@@ -433,8 +458,9 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 
 | 方法 | 说明 |
 | --- | --- |
-| `Run(ctx, input) chan Msg` | 启动一轮 run，需把 channel 读到关闭 |
-| `Stop()` | 取消当前 run（终态事件 `run_stopped`） |
+| `Run(ctx, input) (chan Msg, error)` | 启动一轮 run；error 表示调用方式有问题（如并发调用） |
+| `Result() RunResult` | 已结束 run 的结果：`Answer` / `Stopped` / `Err` |
+| `Stop()` | 取消当前 run（`Result().Stopped` 会变成 true） |
 | `WithHistory(history)` / `History()` | 注入 / 读取 transcript（都是深拷贝） |
 | `HasState()` | 是否已有历史 |
 | `AddTool(tool)` / `GetTool(name)` / `GetTools()` | 工具注册表（`GetTools` 返回副本） |
@@ -467,6 +493,18 @@ type Msg struct {
 }
 
 type ToolEventEmitter func(Msg)
+
+// 运行时只会发这两种消息
+const (
+	MsgTypeReasoning = "reasoning" // 模型的思考内容
+	MsgTypeContent   = "content"   // 回答正文
+)
+
+type RunResult struct {
+	Answer  string // end tool 返回的最终内容
+	Stopped bool   // 是否被取消（Stop / ctx 取消 / 超时）
+	Err     error  // 失败原因
+}
 ```
 
 ### 运行时默认值
@@ -479,7 +517,6 @@ type ToolEventEmitter func(Msg)
 | `noToolCallFailAfter` | 5 | 连续多少次纯文本后 run 失败 |
 | `llmMaxAttempts` | 3 | 单次 LLM 调用尝试次数 |
 | `llmRetryBaseDelay` / `llmRetryMaxDelay` | 500ms / 5s | 重试退避区间 |
-| `heartbeatInterval` | 1s | 心跳间隔 |
 | `eventChannelBuffer` | 256 | `Run` 返回 channel 的缓冲 |
 | `logContentMaxRunes` | 2000 | 日志内容截断长度 |
 
@@ -499,15 +536,16 @@ xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / inf
 | 现象 | 原因与处理 |
 | --- | --- |
 | 编译报 `unknown field ExtraBody` / `ReasoningContent` | 漏了 `replace` 指令——按「安装」一节补到自己的 `go.mod`。 |
-| `run_error: llm call failed after 3 attempts (model=…)` | token 错、base URL 错，或网关不可用。包装的原始原因就在消息里。 |
-| `run_error: agent replied without calling a tool 5 times in a row` | 模型一直只说话不调工具。在 system prompt 里明确「只有 `finish` 能结束任务」，或把 `finish` 做得更好调（参数更少更简单）。 |
-| `run_error: agent execution exceeded max iterations (66)` | 轮次不够或某个工具一直失败。调大 `SetMaxIterations`，或修工具。 |
+| `Result().Err` 为 `llm call failed after 3 attempts (model=…)` | token 错、base URL 错，或网关不可用。包装的原始原因就在错误里。 |
+| `Result().Err` 为 `agent replied without calling a tool 5 times in a row` | 模型一直只说话不调工具。在 system prompt 里明确「只有 `finish` 能结束任务」，或把 `finish` 做得更好调（参数更少更简单）。 |
+| `Result().Err` 为 `agent execution exceeded max iterations (66)` | 轮次不够或某个工具一直失败。调大 `SetMaxIterations`，或修工具。 |
 | 续话时 HTTP 400 | 历史里 assistant 的 `tool_calls` 没有配对的 tool 结果。落库时每条 tool 消息的 `tool_call_id` 必须原样保留。 |
 | run 一直不结束 | 没注册 end tool，或工具名与模型调用的名字不一致。检查 `agent.EndToolNames()`。 |
 | 模型自己写的最终文本没出现在答案里 | 答案只取 end tool 的 `ModelContent`。让 `finish` 返回你想展示的文本；只有它为空时才会回退到模型最后的文本。 |
 | 工具结果像是被截断了 | 超过了 `WithToolResultMaxBytes`，负载被替换成带 `"truncated": true` 的裁剪版。调大上限或让工具少返回一些。 |
-| 压测时出现并发报错 | 一个实例一次只跑一个 run。每个请求新建实例（案例 14）。 |
+| `Run` 返回 `agent is already running` | 一个实例一次只跑一个 run。每个请求新建实例（案例 14）。 |
 | 回答语言不对 | 用 `WithLang("zh-CN")`，语言只由这个选项控制。 |
+| 模型思考时前端没有任何输出 | 运行时只发 `reasoning` 和 `content`；模型没有推理内容时中途就没有输出，最终答案只在 `Result().Answer` 里。 |
 
 ---
 
@@ -530,7 +568,6 @@ make check       # fmt-check + vet + test
 
 1. fork 依赖（见「安装」）需要每个使用方各自声明 `replace`。
 2. 运行时不会自动裁剪 transcript，长对话需要你自己处理（案例 12）。
-3. `attachment.go` 里是产品侧的 chart/dashboard 约定，通用场景可以忽略。
 
 ## 与后端实现的关系
 

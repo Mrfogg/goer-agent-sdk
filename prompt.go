@@ -69,12 +69,3 @@ func (a *BaseAgent) endToolPromptSection() string {
 	}
 	return fmt.Sprintf(endToolModeTemplate, strings.Join(endTools, " or "))
 }
-
-// stopMessage returns the user-facing message emitted when a run is stopped. The
-// SDK ships with a small built-in set; unknown languages fall back to English.
-func stopMessage(lang string) string {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(lang)), "zh") {
-		return "您已停止请求"
-	}
-	return "You have stopped the query"
-}

@@ -204,11 +204,39 @@ func startAgent(t *testing.T, server *httptest.Server, tools ...Tool) *BaseAgent
 	return NewBaseAgent("test-agent", "test agent", "You are a test agent.", "test-model", "test-token", server.URL, tools...)
 }
 
-func collectRun(t *testing.T, agent *BaseAgent, input string) []Msg {
+// collectRun runs one turn and returns the streamed messages together with the
+// run outcome.
+func collectRun(t *testing.T, agent *BaseAgent, input string) ([]Msg, RunResult) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return drain(t, agent.Run(ctx, input))
+
+	stream := startStream(t, agent, ctx, input)
+	return drain(t, stream), agent.Result()
+}
+
+func startStream(t *testing.T, agent *BaseAgent, ctx context.Context, input string) chan Msg {
+	t.Helper()
+	stream, err := agent.Run(ctx, input)
+	if err != nil {
+		t.Fatalf("run %q: %v", input, err)
+	}
+	return stream
+}
+
+// waitForRequest waits until the fake LLM has received at least want requests.
+// Runs that hit a blocking scripted response emit no messages, so tests cannot
+// wait for the first message before cancelling.
+func waitForRequest(t *testing.T, llm *fakeLLM, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if llm.requestCount() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the fake LLM received %d requests, want at least %d", llm.requestCount(), want)
 }
 
 func drain(t *testing.T, msgChan chan Msg) []Msg {
@@ -226,20 +254,6 @@ func drain(t *testing.T, msgChan chan Msg) []Msg {
 			t.Fatalf("run channel did not close; received %v", msgTypes(msgs))
 			return msgs
 		}
-	}
-}
-
-func waitForEvent(t *testing.T, msgChan chan Msg) Msg {
-	t.Helper()
-	select {
-	case msg, open := <-msgChan:
-		if !open {
-			t.Fatal("run channel closed before the first event")
-		}
-		return msg
-	case <-time.After(10 * time.Second):
-		t.Fatal("no run event received")
-		return Msg{}
 	}
 }
 
