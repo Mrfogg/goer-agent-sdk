@@ -13,8 +13,9 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-// RunResult is the outcome of a run. It is available through Result after the
-// channel returned by Run has been closed.
+// RunResult is the outcome of a run. The answer is also emitted on the run
+// stream as a MsgTypeContent message; Result exists so a caller can tell the
+// three endings apart without tracking messages.
 type RunResult struct {
 	// Answer is the final content the end tool returned.
 	Answer string
@@ -27,10 +28,10 @@ type RunResult struct {
 
 // Run starts one agent turn.
 //
-// The returned channel carries the model output as it streams: MsgTypeReasoning
-// messages for the model's thinking and MsgTypeContent messages for the answer
-// text. It is closed when the run ends; read the outcome (final answer, failure
-// or cancellation) from Result afterwards.
+// The returned channel carries the whole output of the run: MsgTypeReasoning
+// messages for the model's thinking, MsgTypeContent messages for the answer
+// text, and a final MsgTypeContent message carrying the end tool's answer. The
+// channel is closed when the run ends.
 //
 // The error is about the call, not the run: the only case today is calling Run
 // while another run is still active, because a BaseAgent owns per-run state and
@@ -50,6 +51,7 @@ func (a *BaseAgent) Run(ctx context.Context, input string) (chan Msg, error) {
 	a.runMu.Lock()
 	a.cancelFunc = cancel
 	a.runMu.Unlock()
+	a.setRunResult(RunResult{}) // a new run must not expose the previous outcome
 
 	if a.planModule != nil {
 		a.planModule.Reset()
@@ -57,27 +59,16 @@ func (a *BaseAgent) Run(ctx context.Context, input string) (chan Msg, error) {
 
 	go func() {
 		defer close(msgChan)
-		var result RunResult
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				agentLogError(ctx, "run panicked: %v\n%s", recovered, debug.Stack())
-				result = RunResult{Err: fmt.Errorf("agent run panicked: %v", recovered)}
+				a.setRunResult(RunResult{Err: fmt.Errorf("agent run panicked: %v", recovered)})
 			}
-			a.finishRun(result)
+			a.finishRun()
 		}()
 
 		xlog.Info("start run with tools: agent=%s", a.Name())
-		answer, err := a.runWithTools(ctx, input, emit)
-		switch {
-		case err == nil:
-			result = RunResult{Answer: answer}
-		case isRunStopped(err) || ctx.Err() != nil:
-			agentLogInfo(ctx, "run stopped: %v", err)
-			result = RunResult{Stopped: true, Err: err}
-		default:
-			agentLogError(ctx, "run with tools failed: %v", err)
-			result = RunResult{Err: err}
-		}
+		a.runWithTools(ctx, input, emit)
 	}()
 
 	return msgChan, nil
@@ -114,19 +105,40 @@ func (a *BaseAgent) beginRun() bool {
 	return true
 }
 
-func (a *BaseAgent) finishRun(result RunResult) {
+func (a *BaseAgent) finishRun() {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 	a.running = false
 	a.cancelFunc = nil
+}
+
+func (a *BaseAgent) setRunResult(result RunResult) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
 	a.runResult = result
+}
+
+// failRun records a failed or cancelled run. Cancellation is reported through
+// RunResult.Stopped, everything else through RunResult.Err.
+func (a *BaseAgent) failRun(ctx context.Context, err error) {
+	if isRunStopped(err) || ctx.Err() != nil {
+		agentLogInfo(ctx, "run stopped: %v", err)
+		a.setRunResult(RunResult{Stopped: true, Err: err})
+		return
+	}
+	agentLogError(ctx, "run failed: %v", err)
+	a.setRunResult(RunResult{Err: err})
 }
 
 // runWithTools drives the tool-calling loop: every iteration is one assistant
 // reply, and the run only finishes when an end tool succeeds.
-func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEventEmitter) (string, error) {
+//
+// It deliberately returns nothing: the output of a run is the message stream
+// (reasoning/content), and the outcome is recorded on the agent for Result.
+func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEventEmitter) {
 	if strings.TrimSpace(a.model) == "" {
-		return "", errors.New("model is not configured: pass a model to NewBaseAgent or WithModel")
+		a.failRun(ctx, errors.New("model is not configured: pass a model to NewBaseAgent or WithModel"))
+		return
 	}
 
 	var collectedContent []string
@@ -147,7 +159,8 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 	noToolCallStreak := 0
 	for iteration := 1; iteration <= a.maxIterations; iteration++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			a.failRun(ctx, err)
+			return
 		}
 
 		messages := a.buildMessages(a.systemPrompt)
@@ -159,7 +172,8 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 			agentLogInfo(ctx, "no tool call for %d consecutive replies, forcing tool_choice=%s", noToolCallStreak, toolChoiceRequired)
 		}
 
-		agentLogInfo(ctx, "start call llm stream: model=%s tool_choice=%s iteration=%d/%d", a.model, toolChoice, iteration, a.maxIterations)
+		agentLogInfo(ctx, "start call llm (%s): model=%s tool_choice=%s iteration=%d/%d",
+			a.outputModeOrDefault(), a.model, toolChoice, iteration, a.maxIterations)
 		response, err := a.callLLMWithRetry(ctx, messages, a.model, toolChoice,
 			func(content string) {
 				emit(Msg{Type: MsgTypeContent, Content: content})
@@ -169,7 +183,8 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 			},
 		)
 		if err != nil {
-			return "", err
+			a.failRun(ctx, err)
+			return
 		}
 
 		assistantMessage := response.Message
@@ -190,7 +205,8 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 		if len(assistantMessage.ToolCalls) == 0 {
 			noToolCallStreak++
 			if noToolCallStreak >= noToolCallFailAfter {
-				return "", fmt.Errorf("agent replied without calling a tool %d times in a row; end-tool mode cannot finish this run", noToolCallStreak)
+				a.failRun(ctx, fmt.Errorf("agent replied without calling a tool %d times in a row; end-tool mode cannot finish this run", noToolCallStreak))
+				return
 			}
 			a.handleNoToolCalls(ctx)
 			continue
@@ -216,10 +232,12 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 			continue
 		}
 
-		return a.finalizeRun(ctx, answer, emit, iteration, fmt.Sprintf("end tool answer: tool=%s", endToolName)), nil
+		a.finalizeRun(ctx, answer, emit, iteration, fmt.Sprintf("end tool answer: tool=%s", endToolName))
+		a.setRunResult(RunResult{Answer: answer})
+		return
 	}
 
-	return "", fmt.Errorf("agent execution exceeded max iterations (%d)", a.maxIterations)
+	a.failRun(ctx, fmt.Errorf("agent execution exceeded max iterations (%d)", a.maxIterations))
 }
 
 // handleNoToolCalls reacts to an assistant turn that produced no tool call. A
@@ -234,11 +252,12 @@ func (a *BaseAgent) handleNoToolCalls(ctx context.Context) {
 	})
 }
 
-// finalizeRun returns the answer an end tool produced. Validating the answer is
-// the end tool's job: it either returns success with the final content, or it
-// fails and the run keeps going. The only thing left here is the optional plan
-// module.
-func (a *BaseAgent) finalizeRun(ctx context.Context, answer string, emit ToolEventEmitter, iterations int, endReason string) string {
+// finalizeRun hands the end tool's answer to the caller: it is emitted on the
+// stream as a MsgTypeContent message, which is the only place a run's result is
+// delivered. Validating the answer is the end tool's job: it either returns
+// success with the final content, or it fails and the run keeps going. The only
+// thing left here is the optional plan module.
+func (a *BaseAgent) finalizeRun(ctx context.Context, answer string, emit ToolEventEmitter, iterations int, endReason string) {
 	answer = strings.TrimSpace(answer)
 	if a.planModule != nil {
 		planCtx := context.WithValue(ctx, ctxkey.AgentHistory, a.messagesForRequest())
@@ -250,6 +269,6 @@ func (a *BaseAgent) finalizeRun(ctx context.Context, answer string, emit ToolEve
 		}
 	}
 
+	emit(Msg{Type: MsgTypeContent, Content: answer})
 	agentLogInfo(ctx, "agent ended with %s: iterations=%d", endReason, iterations)
-	return answer
 }

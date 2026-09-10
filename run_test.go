@@ -34,6 +34,50 @@ func TestRunFinishesThroughEndTool(t *testing.T) {
 	if _, ok := toolMessageByID(agent.History(), "call_1"); !ok {
 		t.Fatalf("missing tool result for call_1: %s", describeHistory(agent.History()))
 	}
+
+	// The end tool's answer is the last thing on the stream.
+	contents := messagesOfType(msgs, MsgTypeContent)
+	if len(contents) == 0 || contents[len(contents)-1].Content != result.Answer {
+		t.Fatalf("final answer was not emitted on the stream: %v", msgTypes(msgs))
+	}
+}
+
+func TestNonStreamingModeEmitsOneMessagePerKind(t *testing.T) {
+	llm := newFakeLLMWithJSON(
+		// First reply is text-only, so the runtime rejects it and retries.
+		jsonReply(t, "thinking about the sheet", "the sheet looks fine"),
+		jsonReply(t, "", "", scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
+	)
+	server := llm.start(t)
+	agent := startAgent(t, server).WithOutputMode(OutputModeNonStreaming)
+
+	msgs, result := collectRun(t, agent, "hi")
+
+	if agent.OutputMode() != OutputModeNonStreaming {
+		t.Fatalf("output mode = %q", agent.OutputMode())
+	}
+	if result.Err != nil || result.Answer != "final answer" {
+		t.Fatalf("run outcome = %+v", result)
+	}
+	if llm.requestAt(t, 0).stream {
+		t.Fatal("non-streaming mode must not ask the model to stream")
+	}
+
+	reasoning := messagesOfType(msgs, MsgTypeReasoning)
+	if len(reasoning) != 1 || reasoning[0].Content != "thinking about the sheet" {
+		t.Fatalf("reasoning messages = %+v", reasoning)
+	}
+
+	contents := messagesOfType(msgs, MsgTypeContent)
+	if len(contents) != 2 {
+		t.Fatalf("content messages = %d, want 2 (one reply, one final answer): %v", len(contents), msgTypes(msgs))
+	}
+	if contents[0].Content != "the sheet looks fine" {
+		t.Fatalf("first content = %q, want the whole reply at once", contents[0].Content)
+	}
+	if contents[1].Content != result.Answer {
+		t.Fatalf("last content = %q, want the final answer %q", contents[1].Content, result.Answer)
+	}
 }
 
 func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
@@ -60,9 +104,13 @@ func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
 	if !ok || reasoning.Content != "let me think about it" {
 		t.Fatalf("reasoning message = %+v (messages: %v)", reasoning, msgTypes(msgs))
 	}
-	content, ok := lastMessageOfType(msgs, MsgTypeContent)
-	if !ok || content.Content != "the answer is 42" {
-		t.Fatalf("content message = %+v (messages: %v)", content, msgTypes(msgs))
+
+	var streamed []string
+	for _, msg := range messagesOfType(msgs, MsgTypeContent) {
+		streamed = append(streamed, msg.Content)
+	}
+	if len(streamed) != 2 || streamed[0] != "the answer is 42" || streamed[1] != "final answer" {
+		t.Fatalf("content messages = %q, want the streamed reply followed by the end tool answer", streamed)
 	}
 	for _, msg := range msgs {
 		if msg.Type == MsgTypeContent && strings.Contains(msg.Content, "think") {
@@ -231,7 +279,7 @@ func TestToolPanicIsReportedAsFailure(t *testing.T) {
 	if !agent.beginRun() {
 		t.Fatal("run slot was not released after a recovered panic")
 	}
-	agent.finishRun(RunResult{})
+	agent.finishRun()
 }
 
 func TestLLMFailureIsRetriedAndReported(t *testing.T) {

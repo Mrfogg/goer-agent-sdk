@@ -99,8 +99,10 @@ func (a *BaseAgent) callLLMWithRetry(ctx context.Context, messages []openai.Chat
 	return llmResponse{}, fmt.Errorf("llm call failed after %d attempts (model=%s): %w", llmMaxAttempts, model, lastErr)
 }
 
-// callLLM calls the large language model with streaming enabled and rebuilds the
-// final assistant message from streamed deltas.
+// callLLM performs one model call and reports the reply through the callbacks:
+// onContent for the answer text and onReasoning for the thinking text. How those
+// callbacks fire depends on the configured OutputMode: several times while the
+// model streams (streaming) or once per reply (non-streaming).
 func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletionMessage, model, toolChoice string, onContent, onReasoning func(string)) (llmResponse, error) {
 	if strings.TrimSpace(model) == "" {
 		model = a.model
@@ -136,6 +138,15 @@ func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletio
 		}
 	}
 
+	if a.outputModeOrDefault() == OutputModeNonStreaming {
+		return a.callLLMOnce(ctx, client, request, onContent, onReasoning)
+	}
+	return a.callLLMStream(ctx, client, request, onContent, onReasoning)
+}
+
+// callLLMStream streams the reply and reports every delta as it arrives.
+func (a *BaseAgent) callLLMStream(ctx context.Context, client *openai.Client, request openai.ChatCompletionRequest, onContent, onReasoning func(string)) (llmResponse, error) {
+	model := request.Model
 	stream, err := client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
 		return llmResponse{}, fmt.Errorf("failed to call LLM (model=%s): %w", model, err)
@@ -196,6 +207,32 @@ func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletio
 		return llmResponse{}, fmt.Errorf("failed to call LLM (model=%s): empty choices", model)
 	}
 
+	return response, nil
+}
+
+// callLLMOnce waits for the reply to complete and then reports the whole
+// thinking text and the whole answer text, one message each.
+func (a *BaseAgent) callLLMOnce(ctx context.Context, client *openai.Client, request openai.ChatCompletionRequest, onContent, onReasoning func(string)) (llmResponse, error) {
+	model := request.Model
+	completion, err := client.CreateChatCompletion(ctx, request)
+	if err != nil {
+		return llmResponse{}, fmt.Errorf("failed to call LLM (model=%s): %w", model, err)
+	}
+	if len(completion.Choices) == 0 {
+		return llmResponse{}, fmt.Errorf("failed to call LLM (model=%s): empty choices", model)
+	}
+
+	choice := completion.Choices[0]
+	response := llmResponse{
+		Message:      choice.Message,
+		FinishReason: choice.FinishReason,
+	}
+	if reasoning := strings.TrimSpace(response.Message.ReasoningContent); reasoning != "" && onReasoning != nil {
+		onReasoning(reasoning)
+	}
+	if content := strings.TrimSpace(response.Message.Content); content != "" && onContent != nil {
+		onContent(content)
+	}
 	return response, nil
 }
 

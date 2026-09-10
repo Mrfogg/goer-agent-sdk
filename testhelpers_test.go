@@ -24,18 +24,26 @@ type fakeLLMRequest struct {
 	toolChoice    any
 	messages      []openai.ChatCompletionMessage
 	headers       http.Header
+	stream        bool
 }
 
-// fakeLLM is an OpenAI-compatible streaming endpoint driven by a script of SSE
-// response bodies. It records every request it receives.
+// fakeLLM is an OpenAI-compatible endpoint driven by two scripts: SSE bodies for
+// streaming requests and JSON bodies for non-streaming ones. It records every
+// request it receives.
 type fakeLLM struct {
-	mu       sync.Mutex
-	script   []string
-	requests []fakeLLMRequest
+	mu         sync.Mutex
+	script     []string
+	jsonScript []string
+	requests   []fakeLLMRequest
 }
 
 func newFakeLLM(script ...string) *fakeLLM {
 	return &fakeLLM{script: script}
+}
+
+// newFakeLLMWithJSON serves non-streaming replies (plain JSON, no SSE).
+func newFakeLLMWithJSON(replies ...string) *fakeLLM {
+	return &fakeLLM{jsonScript: replies}
 }
 
 func (f *fakeLLM) start(t *testing.T) *httptest.Server {
@@ -50,6 +58,7 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		ToolChoice any                            `json:"tool_choice"`
 		Messages   []openai.ChatCompletionMessage `json:"messages"`
+		Stream     bool                           `json:"stream"`
 	}
 	_ = json.Unmarshal(body, &request)
 
@@ -59,10 +68,15 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 		toolChoice:    request.ToolChoice,
 		messages:      request.Messages,
 		headers:       r.Header.Clone(),
+		stream:        request.Stream,
 	})
 	next := ""
-	if len(f.script) > 0 {
-		next, f.script = f.script[0], f.script[1:]
+	if request.Stream {
+		if len(f.script) > 0 {
+			next, f.script = f.script[0], f.script[1:]
+		}
+	} else if len(f.jsonScript) > 0 {
+		next, f.jsonScript = f.jsonScript[0], f.jsonScript[1:]
 	}
 	f.mu.Unlock()
 
@@ -72,6 +86,13 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if next == "" {
 		http.Error(w, "fake llm: script exhausted", http.StatusInternalServerError)
+		return
+	}
+
+	if !request.Stream {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, next)
 		return
 	}
 
@@ -122,6 +143,45 @@ func sseReasoning(t *testing.T, reasoning string) string {
 		},
 	}
 	return "data: " + mustJSON(t, chunk) + "\n\ndata: [DONE]\n\n"
+}
+
+// jsonReply scripts a non-streaming chat completion reply.
+func jsonReply(t *testing.T, reasoning, content string, calls ...scriptedToolCall) string {
+	t.Helper()
+
+	message := map[string]any{"role": "assistant"}
+	if reasoning != "" {
+		message["reasoning_content"] = reasoning
+	}
+	if content != "" {
+		message["content"] = content
+	}
+	finishReason := "stop"
+	if len(calls) > 0 {
+		finishReason = "tool_calls"
+		toolCalls := make([]any, 0, len(calls))
+		for _, call := range calls {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   call.id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      call.name,
+					"arguments": call.arguments,
+				},
+			})
+		}
+		message["tool_calls"] = toolCalls
+	}
+
+	return mustJSON(t, map[string]any{
+		"id":      "chatcmpl-test",
+		"object":  "chat.completion",
+		"created": 0,
+		"model":   "test-model",
+		"choices": []any{
+			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
+		},
+	})
 }
 
 // sseToolCalls scripts an assistant reply carrying tool calls.
@@ -264,6 +324,16 @@ func lastMessageOfType(msgs []Msg, msgType string) (Msg, bool) {
 		}
 	}
 	return Msg{}, false
+}
+
+func messagesOfType(msgs []Msg, msgType string) []Msg {
+	var matched []Msg
+	for _, msg := range msgs {
+		if msg.Type == msgType {
+			matched = append(matched, msg)
+		}
+	}
+	return matched
 }
 
 func msgTypes(msgs []Msg) []string {

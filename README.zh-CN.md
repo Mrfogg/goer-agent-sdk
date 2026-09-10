@@ -150,7 +150,8 @@ func main() {
 
 1. 模型返回工具调用（`count_rows` 或 `finish`）；
 2. 普通工具的结果写回 transcript，循环继续；
-3. `finish` 成功 → channel 关闭，最终答案在 `Result().Answer` 里（就是 end tool 返回的内容）；
+3. `finish` 成功 → 它的内容作为最后一条 `content` 消息发出，随后 channel 关闭
+   （`Result().Answer` 是同一份内容）；
 4. 如果模型只回了一段话、没调工具，运行时会把它退回并附上纠正提示。
 
 更多可运行示例放在 [`examples/`](examples)：`quickstart`、`tools`、`multiturn`、
@@ -306,6 +307,7 @@ cancel() // 或者 agent.Stop()
 
 运行时只会发这两种消息：没有心跳、没有开始标记、也没有终态事件——channel 关闭即 run 结束，
 之后用 `Result()` 拿结果。
+其中最后一条 `content` 一定是 end tool 给出的最终答案。
 
 ### 8. 超时与取消
 
@@ -415,6 +417,25 @@ func handle(w http.ResponseWriter, r *http.Request) {
 一个实例一次只跑一个 run。并发调用第二个 `Run` 会拿到一条
 `agent is already running: one BaseAgent instance handles a single run at a time` 的 error。
 
+### 15. 流式输出与非流式输出
+
+`OutputModeStreaming`（默认）在模型生成过程中就把消息发出来，前端可以边生成边渲染；
+`OutputModeNonStreaming` 等每次回复完成，再按类型各发一条完整消息——适合批量任务、便宜模型，
+或者增量对调用方没意义的场景。
+
+```go
+agent.WithOutputMode(base.OutputModeStreaming)    // 默认：一次回复会来很多条消息
+agent.WithOutputMode(base.OutputModeNonStreaming) // 一次回复只来一条消息
+```
+
+其余一切不变：两种消息类型、end-tool 契约、结果处理方式在两种模式下完全一致。离线示例可以
+直接对比：
+
+```bash
+go run ./examples/localmock                    # 流式
+MODE=non_streaming go run ./examples/localmock # 非流式
+```
+
 ---
 
 ## 运行规则
@@ -427,6 +448,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 6. LLM 传输失败退避重试 3 次（500ms → 1s），失败原因保留在 `Result().Err` 里。
 7. 工具 panic 会被兜进 `Result().Err`，进程不受影响，run 槽位一定释放。
 8. run 结束时 channel 关闭，结果只在 `Result()` 里：成功看 `Answer`，被取消看 `Stopped`，失败看 `Err`。
+9. end tool 的最终答案会作为最后一条 `content` 消息出现在流里，同时镜像到 `Result().Answer`。
+10. 输出模式：`OutputModeStreaming`（默认）与 `OutputModeNonStreaming` 发出的是同样两种消息，区别只是消息到达的频率。
 
 ### 模型实际收到的消息
 
@@ -453,6 +476,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `WithSystemPrompt(prompt)` | 覆盖基础 system prompt |
 | `WithLang(lang)` | 强制回答语言 |
 | `WithReasoningEffort(effort)` | 开启 reasoning 请求参数 |
+| `WithOutputMode(mode)` | `OutputModeStreaming`（默认）或 `OutputModeNonStreaming` |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | 追加 end tool |
 | `WithMemory(module)` | 注入记忆模块 |
 | `WithPlanModule(module)` | 注入计划模块 |
@@ -467,6 +491,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | --- | --- |
 | `Run(ctx, input) (chan Msg, error)` | 启动一轮 run；error 表示调用方式有问题（如并发调用） |
 | `Result() RunResult` | 已结束 run 的结果：`Answer` / `Stopped` / `Err` |
+| `OutputMode()` | 当前的输出模式（默认流式） |
 | `Stop()` | 取消当前 run（`Result().Stopped` 会变成 true） |
 | `WithHistory(history)` / `History()` | 注入 / 读取 transcript（都是深拷贝） |
 | `HasState()` | 是否已有历史 |
@@ -512,6 +537,13 @@ type RunResult struct {
 	Stopped bool   // 是否被取消（Stop / ctx 取消 / 超时）
 	Err     error  // 失败原因
 }
+
+type OutputMode string
+
+const (
+	OutputModeStreaming    OutputMode = "streaming"     // 生成过程中就发消息
+	OutputModeNonStreaming OutputMode = "non_streaming" // 每次回复只发一条
+)
 ```
 
 ### 运行时默认值
@@ -553,6 +585,7 @@ xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / inf
 | `Run` 返回 `agent is already running` | 一个实例一次只跑一个 run。每个请求新建实例（案例 14）。 |
 | 回答语言不对 | 用 `WithLang("zh-CN")`，语言只由这个选项控制。 |
 | 模型思考时前端没有任何输出 | 运行时只发 `reasoning` 和 `content`；模型没有推理内容时中途就没有输出，最终答案只在 `Result().Answer` 里。 |
+| 内容是一次性出现的、没有流式效果 | agent 处于 `OutputModeNonStreaming`。改成 `OutputModeStreaming`（默认）即可，或干脆不调用 `WithOutputMode`。 |
 
 ---
 

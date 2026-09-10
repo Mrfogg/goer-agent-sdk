@@ -24,6 +24,20 @@ type Agent interface {
 	Run(ctx context.Context, input string) (chan Msg, error)
 }
 
+// OutputMode selects how model output is delivered on the run stream.
+type OutputMode string
+
+const (
+	// OutputModeStreaming emits MsgTypeReasoning and MsgTypeContent messages while
+	// the model is generating, so a frontend can render text as it appears. It is
+	// the default.
+	OutputModeStreaming OutputMode = "streaming"
+
+	// OutputModeNonStreaming waits for each model reply to complete and then emits
+	// it as a single message per kind.
+	OutputModeNonStreaming OutputMode = "non_streaming"
+)
+
 // AgentContextSnapshot is a serializable view of an agent's conversation state,
 // so callers can persist it between turns and restore it with WithHistory.
 type AgentContextSnapshot struct {
@@ -43,6 +57,7 @@ type BaseAgent struct {
 	systemPrompt       string
 	model              string
 	reasoningEffort    string
+	outputMode         OutputMode
 	lang               string
 	maxIterations      int
 	authToken          string
@@ -137,6 +152,32 @@ func (a *BaseAgent) WithModel(model string) *BaseAgent {
 func (a *BaseAgent) WithReasoningEffort(effort string) *BaseAgent {
 	a.reasoningEffort = effort
 	return a
+}
+
+// WithOutputMode selects how the model output is delivered on the run stream:
+// OutputModeStreaming (default) emits messages while the model generates,
+// OutputModeNonStreaming emits one message per reply after it completes.
+// Unknown values are ignored.
+func (a *BaseAgent) WithOutputMode(mode OutputMode) *BaseAgent {
+	switch mode {
+	case OutputModeStreaming, OutputModeNonStreaming:
+		a.outputMode = mode
+	default:
+		agentLogWarn(nil, "unknown output mode %q, keeping %s", mode, a.outputModeOrDefault())
+	}
+	return a
+}
+
+// OutputMode returns the configured output mode, defaulting to streaming.
+func (a *BaseAgent) OutputMode() OutputMode {
+	return a.outputModeOrDefault()
+}
+
+func (a *BaseAgent) outputModeOrDefault() OutputMode {
+	if a.outputMode == OutputModeNonStreaming {
+		return OutputModeNonStreaming
+	}
+	return OutputModeStreaming
 }
 
 // WithSystemPrompt replaces the base system prompt.

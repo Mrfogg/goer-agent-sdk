@@ -1,7 +1,8 @@
 // Command localmock runs a complete agent turn against a local mock of the
-// OpenAI streaming endpoint, so it needs no API key and no network:
+// OpenAI chat completions endpoint, so it needs no API key and no network:
 //
-//	go run ./examples/localmock
+//	go run ./examples/localmock                     # streaming output (default)
+//	MODE=non_streaming go run ./examples/localmock  # non-streaming output
 //
 // The mock answers the three requests of this run on purpose:
 //
@@ -9,12 +10,16 @@
 //  2. thinking text plus a text-only answer, which the runtime rejects because
 //     only an end tool may finish a run, so it retries with a corrective message
 //  3. a finish tool call, which ends the run
+//
+// It implements both response shapes too: SSE chunks for streaming and a plain
+// JSON completion for non-streaming.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +32,8 @@ import (
 
 const systemPrompt = `You are a spreadsheet assistant.
 Use count_rows to inspect the sheet, then call finish with the final answer.`
+
+const runTimeout = 30 * time.Second
 
 type countRowsTool struct{}
 
@@ -62,7 +69,7 @@ func main() {
 	defer func() { _ = server.Close() }()
 
 	baseURL := "http://" + listener.Addr().String()
-	fmt.Printf("mock OpenAI endpoint: %s\n\n", baseURL)
+	fmt.Printf("mock OpenAI endpoint: %s\n", baseURL)
 
 	agent := base.NewBaseAgent(
 		"localmock",
@@ -72,10 +79,11 @@ func main() {
 		"not-needed", // the mock ignores the token
 		baseURL,
 		finishTool{},
-	)
+	).WithOutputMode(outputModeFromEnv())
 	agent.AddTool(countRowsTool{})
+	fmt.Printf("output mode: %s\n\n", agent.OutputMode())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 
 	stream, err := agent.Run(ctx, "How many rows does this sheet have?")
@@ -84,12 +92,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// In streaming mode the model output arrives in many pieces; in
+	// non-streaming mode each reply arrives as one message. Either way the last
+	// content message is the end tool's answer.
 	for msg := range stream {
 		switch msg.Type {
 		case base.MsgTypeReasoning:
 			fmt.Printf("[thinking] %s\n", msg.Content)
 		case base.MsgTypeContent:
-			fmt.Printf("[answer] %s\n", msg.Content)
+			fmt.Printf("[content] %s\n", msg.Content)
 		}
 	}
 
@@ -98,81 +109,169 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", result.Err)
 		os.Exit(1)
 	}
-	fmt.Println("\nfinal answer:", result.Answer)
+	fmt.Println("\nresult.Answer:", result.Answer)
 	fmt.Printf("transcript: %d messages\n", len(agent.History()))
 }
 
-// mockLLM scripts a streaming OpenAI-compatible endpoint. The reply depends on
-// how many requests it has already answered.
+func outputModeFromEnv() base.OutputMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODE"))) {
+	case "non_streaming", "non-streaming", "buffer", "buffered":
+		return base.OutputModeNonStreaming
+	default:
+		return base.OutputModeStreaming
+	}
+}
+
+// mockLLM replies according to how many requests it has already answered, and
+// answers with SSE or plain JSON depending on what the client asked for.
 type mockLLM struct {
 	mu       sync.Mutex
 	requests int
 }
 
+type mockToolCall struct {
+	id        string
+	name      string
+	arguments string
+}
+
+type mockReply struct {
+	reasoning string
+	content   string
+	toolCall  *mockToolCall
+}
+
+func replyFor(index int) mockReply {
+	switch index {
+	case 1:
+		return mockReply{toolCall: &mockToolCall{id: "call_rows", name: "count_rows", arguments: "{}"}}
+	case 2:
+		return mockReply{
+			reasoning: "I already know the row count. ",
+			content:   "The sheet has 120 rows.",
+		}
+	case 3:
+		return mockReply{toolCall: &mockToolCall{
+			id:        "call_finish",
+			name:      "finish",
+			arguments: `{"answer":"The sheet has **120 rows**."}`,
+		}}
+	default:
+		return mockReply{content: "nothing left to do."}
+	}
+}
+
 func (m *mockLLM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var request struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &request)
+
 	m.mu.Lock()
 	m.requests++
 	index := m.requests
 	m.mu.Unlock()
 
+	reply := replyFor(index)
+	if !request.Stream {
+		writeCompletion(w, reply)
+		return
+	}
+	writeStream(w, reply)
+}
+
+func writeStream(w http.ResponseWriter, reply mockReply) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 
-	switch index {
-	case 1:
-		writeToolCall(w, "call_rows", "count_rows", "{}")
-	case 2:
-		writeReasoning(w, "I already know the row count. ")
-		writeContent(w, "The sheet has 120 rows.")
-	case 3:
-		writeToolCall(w, "call_finish", "finish", `{"answer":"The sheet has **120 rows**."}`)
-	default:
-		writeContent(w, "nothing left to do.")
+	if reply.reasoning != "" {
+		writeChunk(w, map[string]any{
+			"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "reasoning_content": reply.reasoning}},
+			},
+		})
 	}
+	if reply.content != "" {
+		writeChunk(w, map[string]any{
+			"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": reply.content}},
+			},
+		})
+	}
+	if reply.toolCall != nil {
+		writeChunk(w, map[string]any{
+			"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{
+					"role": "assistant",
+					"tool_calls": []any{map[string]any{
+						"index": 0,
+						"id":    reply.toolCall.id,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      reply.toolCall.name,
+							"arguments": reply.toolCall.arguments,
+						},
+					}},
+				}},
+			},
+		})
+	}
+
+	finishReason := "stop"
+	if reply.toolCall != nil {
+		finishReason = "tool_calls"
+	}
+	writeChunk(w, map[string]any{
+		"choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason},
+		},
+	})
 	fmt.Fprint(w, "data: [DONE]\n\n")
+
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 }
 
-func writeReasoning(w http.ResponseWriter, text string) {
-	writeChunk(w, map[string]any{
-		"choices": []any{
-			map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "reasoning_content": text}},
-		},
-	})
-}
+func writeCompletion(w http.ResponseWriter, reply mockReply) {
+	message := map[string]any{"role": "assistant"}
+	if reply.reasoning != "" {
+		message["reasoning_content"] = reply.reasoning
+	}
+	if reply.content != "" {
+		message["content"] = reply.content
+	}
+	finishReason := "stop"
+	if reply.toolCall != nil {
+		finishReason = "tool_calls"
+		message["tool_calls"] = []any{map[string]any{
+			"id":   reply.toolCall.id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      reply.toolCall.name,
+				"arguments": reply.toolCall.arguments,
+			},
+		}}
+	}
 
-func writeContent(w http.ResponseWriter, text string) {
-	writeChunk(w, map[string]any{
+	payload, err := json.Marshal(map[string]any{
+		"id":      "chatcmpl-mock",
+		"object":  "chat.completion",
+		"created": 0,
+		"model":   "mock-model",
 		"choices": []any{
-			map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": text}},
+			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
 		},
 	})
-}
+	if err != nil {
+		http.Error(w, "mock: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-func writeToolCall(w http.ResponseWriter, id, name, arguments string) {
-	writeChunk(w, map[string]any{
-		"choices": []any{
-			map[string]any{"index": 0, "delta": map[string]any{
-				"role": "assistant",
-				"tool_calls": []any{map[string]any{
-					"index": 0,
-					"id":    id,
-					"type":  "function",
-					"function": map[string]any{
-						"name":      name,
-						"arguments": arguments,
-					},
-				}},
-			}},
-		},
-	})
-	writeChunk(w, map[string]any{
-		"choices": []any{
-			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"},
-		},
-	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
 }
 
 func writeChunk(w http.ResponseWriter, payload map[string]any) {

@@ -155,8 +155,8 @@ What happens at runtime:
 
 1. the model replies with a tool call (`count_rows` or `finish`);
 2. regular tool results go back into the transcript and the loop continues;
-3. a successful `finish` ends the run: the channel closes and `Result().Answer` holds the content
-   your end tool returned;
+3. a successful `finish` ends the run: its content is emitted as the last `content` message and
+   the channel closes (`Result().Answer` holds the same text);
 4. if the model answers with prose only, the runtime sends it back with a corrective message.
 
 More runnable programs live in [`examples/`](examples): `quickstart`, `tools`,
@@ -316,6 +316,7 @@ cancel() // or: agent.Stop()
 
 Those are the only two types the runtime ever emits. There is no heartbeat, no start marker and
 no terminal event: the channel simply closes, and `Result()` then tells you how the run ended.
+The last `content` message is always the end tool's answer.
 
 ### 8. Timeouts and cancellation
 
@@ -428,6 +429,25 @@ func handle(w http.ResponseWriter, r *http.Request) {
 One instance handles one run. A concurrent second `Run` returns an error reading
 `agent is already running: one BaseAgent instance handles a single run at a time`.
 
+### 15. Streaming or non-streaming output
+
+`OutputModeStreaming` (the default) emits messages while the model generates, so a frontend can
+render text as it appears. `OutputModeNonStreaming` waits for each reply to complete and emits it
+as one message per kind — useful for batch jobs, cheap models, or when deltas are just noise.
+
+```go
+agent.WithOutputMode(base.OutputModeStreaming)    // default: many messages per reply
+agent.WithOutputMode(base.OutputModeNonStreaming) // one message per reply
+```
+
+Everything else stays the same: the two message types, the end-tool contract and result handling
+do not change with the mode. The offline example can show both:
+
+```bash
+go run ./examples/localmock                    # streaming
+MODE=non_streaming go run ./examples/localmock # non-streaming
+```
+
 ---
 
 ## Behavior rules
@@ -443,6 +463,10 @@ One instance handles one run. A concurrent second `Run` returns an error reading
    released.
 8. The channel closes when the run ends. The outcome is only in `Result()`:
    `Answer` on success, `Stopped` for cancellation, `Err` for failure.
+9. The end tool's answer is delivered on the stream as the last `content` message, and mirrored in
+   `Result().Answer`.
+10. Output modes: `OutputModeStreaming` (default) and `OutputModeNonStreaming` emit the same two
+    message types; they only differ in how often messages arrive.
 
 ### What the model actually receives
 
@@ -471,6 +495,7 @@ are skipped; at least one usable end tool is required.
 | `WithSystemPrompt(prompt)` | Replace the base system prompt |
 | `WithLang(lang)` | Pin the answer language |
 | `WithReasoningEffort(effort)` | Enable reasoning request fields |
+| `WithOutputMode(mode)` | `OutputModeStreaming` (default) or `OutputModeNonStreaming` |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | Register more end tools |
 | `WithMemory(module)` | Inject a memory module |
 | `WithPlanModule(module)` | Inject a plan module |
@@ -485,6 +510,7 @@ are skipped; at least one usable end tool is required.
 | --- | --- |
 | `Run(ctx, input) (chan Msg, error)` | Start a run; the error reports a misuse such as a concurrent run |
 | `Result() RunResult` | The outcome of the finished run: `Answer`, `Stopped`, `Err` |
+| `OutputMode()` | The configured output mode (defaults to streaming) |
 | `Stop()` | Cancel the run (`Result().Stopped` becomes true) |
 | `WithHistory(history)` / `History()` | Seed / read the transcript (deep copies) |
 | `HasState()` | Whether history exists |
@@ -530,6 +556,13 @@ type RunResult struct {
 	Stopped bool   // the run was cancelled (Stop, ctx cancel or deadline)
 	Err     error  // failure reason
 }
+
+type OutputMode string
+
+const (
+	OutputModeStreaming    OutputMode = "streaming"     // messages while generating
+	OutputModeNonStreaming OutputMode = "non_streaming" // one message per reply
+)
 ```
 
 ### Runtime defaults
@@ -571,6 +604,7 @@ carries `chat_id=`, and model output, tool arguments and results are clipped.
 | `Run` returns `agent is already running` | One agent instance = one run. Build a new instance per request (recipe 14). |
 | Answers come back in the wrong language | Set `WithLang("zh-CN")` — the language is only controlled by this option. |
 | Nothing shows up while the model is thinking | Only `reasoning` and `content` messages are emitted; if the model returns plain text without reasoning there is no early output, and the final answer only appears in `Result().Answer`. |
+| Text appears all at once instead of streaming | The agent is in `OutputModeNonStreaming`. Switch to `OutputModeStreaming` (the default), or leave `WithOutputMode` unset. |
 
 ---
 
