@@ -63,6 +63,35 @@ func TestTextOnlyReplyIsRejectedAndRetried(t *testing.T) {
 	}
 }
 
+func TestReasoningAndContentDeltasAreSeparated(t *testing.T) {
+	llm := newFakeLLM(
+		sseReasoning(t, "let me think about it"),
+		sseText(t, "the answer is 42"),
+		sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
+	)
+	server := llm.start(t)
+	agent := startAgent(t, server)
+
+	msgs := collectRun(t, agent, "hi")
+
+	reasoning, ok := lastMessageOfType(msgs, MsgTypeReasoning)
+	if !ok || reasoning.Content != "let me think about it" {
+		t.Fatalf("reasoning event = %+v (events: %v)", reasoning, msgTypes(msgs))
+	}
+	content, ok := lastMessageOfType(msgs, MsgTypeContent)
+	if !ok || content.Content != "the answer is 42" {
+		t.Fatalf("content event = %+v (events: %v)", content, msgTypes(msgs))
+	}
+	for _, msg := range msgs {
+		if msg.Type == MsgTypeContent && strings.Contains(msg.Content, "think") {
+			t.Fatalf("reasoning text leaked into the content stream: %q", msg.Content)
+		}
+		if msg.Type == MsgTypeReasoning && strings.Contains(msg.Content, "42") {
+			t.Fatalf("answer text leaked into the reasoning stream: %q", msg.Content)
+		}
+	}
+}
+
 func TestRepeatedTextOnlyRepliesEscalateAndFail(t *testing.T) {
 	llm := newFakeLLM(
 		sseText(t, "one"), sseText(t, "two"), sseText(t, "three"),

@@ -113,6 +113,17 @@ func sseText(t *testing.T, content string) string {
 	return "data: " + mustJSON(t, chunk) + "\n\ndata: [DONE]\n\n"
 }
 
+// sseReasoning scripts an assistant reply that streams reasoning (thinking) text.
+func sseReasoning(t *testing.T, reasoning string) string {
+	t.Helper()
+	chunk := map[string]any{
+		"choices": []any{
+			map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "reasoning_content": reasoning}},
+		},
+	}
+	return "data: " + mustJSON(t, chunk) + "\n\ndata: [DONE]\n\n"
+}
+
 // sseToolCalls scripts an assistant reply carrying tool calls.
 func sseToolCalls(t *testing.T, calls ...scriptedToolCall) string {
 	t.Helper()

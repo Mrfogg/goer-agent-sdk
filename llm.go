@@ -68,12 +68,12 @@ type llmResponse struct {
 // callLLMWithRetry performs one logical LLM call, retrying transport failures
 // with bounded exponential backoff. Cancellation stops retrying immediately and
 // the last failure is preserved in the returned error.
-func (a *BaseAgent) callLLMWithRetry(ctx context.Context, messages []openai.ChatCompletionMessage, model, toolChoice string, onContent func(string)) (llmResponse, error) {
+func (a *BaseAgent) callLLMWithRetry(ctx context.Context, messages []openai.ChatCompletionMessage, model, toolChoice string, onContent, onReasoning func(string)) (llmResponse, error) {
 	delay := llmRetryBaseDelay
 	var lastErr error
 
 	for attempt := 1; attempt <= llmMaxAttempts; attempt++ {
-		response, err := a.callLLM(ctx, messages, model, toolChoice, onContent)
+		response, err := a.callLLM(ctx, messages, model, toolChoice, onContent, onReasoning)
 		if err == nil {
 			return response, nil
 		}
@@ -101,7 +101,7 @@ func (a *BaseAgent) callLLMWithRetry(ctx context.Context, messages []openai.Chat
 
 // callLLM calls the large language model with streaming enabled and rebuilds the
 // final assistant message from streamed deltas.
-func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletionMessage, model, toolChoice string, onContent func(string)) (llmResponse, error) {
+func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletionMessage, model, toolChoice string, onContent, onReasoning func(string)) (llmResponse, error) {
 	if strings.TrimSpace(model) == "" {
 		model = a.model
 	}
@@ -167,7 +167,7 @@ func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletio
 		}
 		if choice.Delta.Content != "" {
 			response.Message.Content += choice.Delta.Content
-			if onContent != nil {
+			if onContent != nil && strings.TrimSpace(response.Message.Content) != "" {
 				onContent(response.Message.Content)
 			}
 		}
@@ -176,8 +176,8 @@ func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletio
 		}
 		if choice.Delta.ReasoningContent != "" {
 			response.Message.ReasoningContent += choice.Delta.ReasoningContent
-			if onContent != nil {
-				onContent(response.Message.ReasoningContent)
+			if onReasoning != nil && strings.TrimSpace(response.Message.ReasoningContent) != "" {
+				onReasoning(response.Message.ReasoningContent)
 			}
 		}
 		if choice.Delta.FunctionCall != nil {

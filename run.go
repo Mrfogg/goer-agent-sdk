@@ -175,12 +175,14 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 		}
 
 		agentLogInfo(ctx, "start call llm stream: model=%s tool_choice=%s iteration=%d/%d", a.model, toolChoice, iteration, a.maxIterations)
-		response, err := a.callLLMWithRetry(ctx, messages, a.model, toolChoice, func(content string) {
-			emit(Msg{
-				Type:    MsgTypeProgressUpdate,
-				Content: content,
-			})
-		})
+		response, err := a.callLLMWithRetry(ctx, messages, a.model, toolChoice,
+			func(content string) {
+				emit(Msg{Type: MsgTypeContent, Content: content})
+			},
+			func(reasoning string) {
+				emit(Msg{Type: MsgTypeReasoning, Content: reasoning})
+			},
+		)
 		if err != nil {
 			return "", err
 		}

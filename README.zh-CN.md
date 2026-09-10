@@ -119,8 +119,10 @@ func main() {
 
 	for msg := range agent.Run(ctx, "这张表有多少行？") {
 		switch msg.Type {
-		case base.MsgTypeProgressUpdate:
-			fmt.Print(msg.Content) // 流式增量
+		case base.MsgTypeReasoning:
+			fmt.Print(msg.Content) // 模型的思考内容，流式
+		case base.MsgTypeContent:
+			fmt.Print(msg.Content) // 回答正文，流式
 		case base.MsgTypeRunDone:
 			fmt.Println("\nanswer:", msg.Content)
 		case base.MsgTypeRunError:
@@ -278,7 +280,8 @@ cancel() // 或者 agent.Stop()
 | 你会收到的事件 | 含义 |
 | --- | --- |
 | `start` | run 开始 |
-| `progress_update` | 流式回答 / 推理增量 |
+| `reasoning` | 模型的思考（推理）内容，流式吐出 |
+| `content` | 回答正文，流式吐出 |
 | `heartbeat` | 每秒一次，说明 run 还活着 |
 | `markdown` | 最终答案文本 |
 | `run_done` / `run_error` / `run_stopped` | run 结束，随后 channel 关闭 |
@@ -314,7 +317,7 @@ agent := base.NewBaseAgent("analyst", "数据分析", prompt, model, apiKey, "ht
 agent.WithReasoningEffort("medium") // 发送 reasoning_effort 与 thinking/reasoning 请求体字段
 ```
 
-推理内容也会以 `progress_update` 流式吐出。传空串即关闭。
+推理内容会以 `reasoning` 事件单独吐出，与回答正文的 `content` 事件分开。传空串即关闭 reasoning 请求参数。
 
 ### 11. 记忆模块与计划模块
 
@@ -525,11 +528,9 @@ make check       # fmt-check + vet + test
 
 ## 已知限制
 
-1. `skill.go` 未接线：没有任何地方使用 `Skill`/`BaseSkill`，`AllowedTools` 不生效，
-   `Instruction`/`Model`/`MaxIterations` 也不会影响 run。要么接进去，要么删掉。
-2. fork 依赖（见「安装」）需要每个使用方各自声明 `replace`。
-3. 运行时不会自动裁剪 transcript，长对话需要你自己处理（案例 12）。
-4. `attachment.go` 里是产品侧的 chart/dashboard 约定，通用场景可以忽略。
+1. fork 依赖（见「安装」）需要每个使用方各自声明 `replace`。
+2. 运行时不会自动裁剪 transcript，长对话需要你自己处理（案例 12）。
+3. `attachment.go` 里是产品侧的 chart/dashboard 约定，通用场景可以忽略。
 
 ## 与后端实现的关系
 

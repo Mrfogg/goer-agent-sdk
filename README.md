@@ -124,8 +124,10 @@ func main() {
 
 	for msg := range agent.Run(ctx, "How many rows does this sheet have?") {
 		switch msg.Type {
-		case base.MsgTypeProgressUpdate:
-			fmt.Print(msg.Content) // streaming delta
+		case base.MsgTypeReasoning:
+			fmt.Print(msg.Content) // the model's thinking, streamed
+		case base.MsgTypeContent:
+			fmt.Print(msg.Content) // the answer text, streamed
 		case base.MsgTypeRunDone:
 			fmt.Println("\nanswer:", msg.Content)
 		case base.MsgTypeRunError:
@@ -286,7 +288,8 @@ cancel() // or: agent.Stop()
 | Event | Meaning |
 | --- | --- |
 | `start` | the run began |
-| `progress_update` | streaming answer / reasoning delta |
+| `reasoning` | the model's thinking (reasoning) text, streamed |
+| `content` | the answer text, streamed |
 | `heartbeat` | the run is alive (every second) |
 | `markdown` | the final answer text |
 | `run_done` / `run_error` / `run_stopped` | the run is over; the channel closes next |
@@ -322,7 +325,8 @@ agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, apiKey, "ht
 agent.WithReasoningEffort("medium") // sends reasoning_effort + thinking/reasoning body fields
 ```
 
-Reasoning deltas are streamed as `progress_update` as well. Pass an empty string to disable it.
+Reasoning deltas are streamed as `reasoning` events, kept apart from the answer text that
+arrives as `content` events. Pass an empty string to disable the reasoning request fields.
 
 ### 11. Memory and plan modules
 
@@ -538,12 +542,10 @@ same checks on `main` and on pull requests.
 
 ## Known limitations
 
-1. `skill.go` is not wired up: nothing uses `Skill`/`BaseSkill`, `AllowedTools` is not enforced,
-   and `Instruction`/`Model`/`MaxIterations` never reach a run. Wire it in or delete it.
-2. The fork dependency (see Installation) must be repeated by every consumer.
-3. The runtime does not trim the transcript — long conversations need your own strategy
+1. The fork dependency (see Installation) must be repeated by every consumer.
+2. The runtime does not trim the transcript — long conversations need your own strategy
    (recipe 12).
-4. `attachment.go` holds product-specific chart/dashboard conventions; ignore it if your product
+3. `attachment.go` holds product-specific chart/dashboard conventions; ignore it if your product
    does not use them.
 
 ## Relationship to the backend copy
