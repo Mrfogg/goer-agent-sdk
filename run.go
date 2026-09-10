@@ -7,8 +7,8 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/excelmatic/goer-agent-sdk/ctxkey"
-	"github.com/excelmatic/goer-agent-sdk/xlog"
+	"github.com/Mrfogg/goer-agent-sdk/ctxkey"
+	"github.com/Mrfogg/goer-agent-sdk/xlog"
 
 	"github.com/sashabaranov/go-openai"
 )

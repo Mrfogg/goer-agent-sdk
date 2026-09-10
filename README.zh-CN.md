@@ -27,7 +27,7 @@ for msg := range agent.Run(ctx, "帮我总结这张表") {
 ## 安装
 
 ```bash
-go get github.com/excelmatic/goer-agent-sdk
+go get github.com/Mrfogg/goer-agent-sdk
 ```
 
 ### 必读：必须加 `replace`
@@ -50,7 +50,7 @@ replace github.com/sashabaranov/go-openai => github.com/neugls/go-openai v1.42.0
   字段不存在。
 - **Go 不继承依赖的 `replace`**：写在 SDK 仓库自己的 `go.mod` 里对使用方没用，必须各自复制上面两行。
 - **SDK 不在同一仓库时**，再加一行
-  `replace github.com/excelmatic/goer-agent-sdk => ../goer-agent-sdk`。
+  `replace github.com/Mrfogg/goer-agent-sdk => ../goer-agent-sdk`。
 - **fork 必须能拉到**（公开或已鉴权），否则你的 CI 在干净机器上 `go mod download` 会失败。
 
 如果你的网关完全不需要 reasoning 字段，可以不调用 `WithReasoningEffort(...)`，直接依赖上游
@@ -73,7 +73,7 @@ import (
 	"os"
 	"strings"
 
-	base "github.com/excelmatic/goer-agent-sdk"
+	base "github.com/Mrfogg/goer-agent-sdk"
 )
 
 // 1. 普通工具：模型干活过程中可以调它。
@@ -198,7 +198,7 @@ return base.ToolResult{
 工具可以往产品侧推事件，而不会污染模型上下文：
 
 ```go
-import "github.com/excelmatic/goer-agent-sdk/ctxkey"
+import "github.com/Mrfogg/goer-agent-sdk/ctxkey"
 
 func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	option := buildChartOption(args) // 你自己的逻辑

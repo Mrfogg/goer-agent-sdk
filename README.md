@@ -29,7 +29,7 @@ for msg := range agent.Run(ctx, "Summarize this sheet") {
 ## Installation
 
 ```
-go get github.com/excelmatic/goer-agent-sdk
+go get github.com/Mrfogg/goer-agent-sdk
 ```
 
 ### Required: the `replace` directive
@@ -54,7 +54,7 @@ Why it matters, in practice:
 - **Go ignores the `replace` directives of dependencies**: having it in this repository's
   `go.mod` does not help consumers — each consumer copies the two lines above.
 - **If the SDK lives next to your code instead of on GitHub**, also add
-  `replace github.com/excelmatic/goer-agent-sdk => ../goer-agent-sdk`.
+  `replace github.com/Mrfogg/goer-agent-sdk => ../goer-agent-sdk`.
 - **The fork must be reachable** (public, or authenticated) for your CI as well, because
   `go mod download` fetches it on a clean machine.
 
@@ -78,7 +78,7 @@ import (
 	"os"
 	"strings"
 
-	base "github.com/excelmatic/goer-agent-sdk"
+	base "github.com/Mrfogg/goer-agent-sdk"
 )
 
 // 1. A regular tool: the model may call it while working.
@@ -204,7 +204,7 @@ return base.ToolResult{
 Tools push events to your frontend without polluting the model context:
 
 ```go
-import "github.com/excelmatic/goer-agent-sdk/ctxkey"
+import "github.com/Mrfogg/goer-agent-sdk/ctxkey"
 
 func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	option := buildChartOption(args) // your code

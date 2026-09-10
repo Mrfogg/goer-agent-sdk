@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/excelmatic/goer-agent-sdk/ctxkey"
+	"github.com/Mrfogg/goer-agent-sdk/ctxkey"
 
 	"github.com/sashabaranov/go-openai"
 )

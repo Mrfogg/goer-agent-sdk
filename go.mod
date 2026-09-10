@@ -1,4 +1,4 @@
-module github.com/excelmatic/goer-agent-sdk
+module github.com/Mrfogg/goer-agent-sdk
 
 go 1.23
 
