@@ -101,6 +101,9 @@ func main() {
 			fmt.Printf("[thinking] %s\n", msg.Content)
 		case base.MsgTypeContent:
 			fmt.Printf("[content] %s\n", msg.Content)
+		case base.MsgTypeUsage:
+			fmt.Printf("[usage] input=%v output=%v total=%v\n",
+				msg.Data["prompt_tokens"], msg.Data["completion_tokens"], msg.Data["total_tokens"])
 		}
 	}
 
@@ -110,6 +113,8 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("\nresult.Answer:", result.Answer)
+	fmt.Printf("run usage: input=%d output=%d total=%d over %d LLM calls\n",
+		result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens, result.LLMCalls)
 	fmt.Printf("transcript: %d messages\n", len(agent.History()))
 }
 
@@ -222,6 +227,17 @@ func writeStream(w http.ResponseWriter, reply mockReply) {
 	if reply.toolCall != nil {
 		finishReason = "tool_calls"
 	}
+	// Providers send usage on the final chunk when the request asks for
+	// stream_options.include_usage; the agent forwards it as a usage message.
+	writeChunk(w, map[string]any{
+		"choices": []any{},
+		"model":   "mock-model",
+		"usage": map[string]any{
+			"prompt_tokens":     120,
+			"completion_tokens": 24,
+			"total_tokens":      144,
+		},
+	})
 	writeChunk(w, map[string]any{
 		"choices": []any{
 			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason},
@@ -260,6 +276,11 @@ func writeCompletion(w http.ResponseWriter, reply mockReply) {
 		"object":  "chat.completion",
 		"created": 0,
 		"model":   "mock-model",
+		"usage": map[string]any{
+			"prompt_tokens":     120,
+			"completion_tokens": 24,
+			"total_tokens":      144,
+		},
 		"choices": []any{
 			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
 		},

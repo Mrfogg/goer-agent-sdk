@@ -25,7 +25,15 @@ type fakeLLMRequest struct {
 	messages      []openai.ChatCompletionMessage
 	headers       http.Header
 	stream        bool
+	includeUsage  bool
 }
+
+// Token counts the scripted replies report, so tests can assert what the agent
+// forwards without depending on a real model.
+const (
+	testPromptTokens     = 10
+	testCompletionTokens = 5
+)
 
 // fakeLLM is an OpenAI-compatible endpoint driven by two scripts: SSE bodies for
 // streaming requests and JSON bodies for non-streaming ones. It records every
@@ -56,12 +64,16 @@ func (f *fakeLLM) start(t *testing.T) *httptest.Server {
 func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var request struct {
-		ToolChoice any                            `json:"tool_choice"`
-		Messages   []openai.ChatCompletionMessage `json:"messages"`
-		Stream     bool                           `json:"stream"`
+		ToolChoice    any                            `json:"tool_choice"`
+		Messages      []openai.ChatCompletionMessage `json:"messages"`
+		Stream        bool                           `json:"stream"`
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
 	}
 	_ = json.Unmarshal(body, &request)
 
+	includeUsage := request.StreamOptions != nil && request.StreamOptions.IncludeUsage
 	f.mu.Lock()
 	f.requests = append(f.requests, fakeLLMRequest{
 		authorization: r.Header.Get("Authorization"),
@@ -69,6 +81,7 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 		messages:      request.Messages,
 		headers:       r.Header.Clone(),
 		stream:        request.Stream,
+		includeUsage:  includeUsage,
 	})
 	next := ""
 	if request.Stream {
@@ -126,12 +139,18 @@ type scriptedToolCall struct {
 // sseText scripts a text-only assistant reply.
 func sseText(t *testing.T, content string) string {
 	t.Helper()
+	return sseTextWithUsage(t, content, testPromptTokens, testCompletionTokens)
+}
+
+// sseTextWithUsage scripts a text-only reply with explicit token counts.
+func sseTextWithUsage(t *testing.T, content string, promptTokens, completionTokens int) string {
+	t.Helper()
 	chunk := map[string]any{
 		"choices": []any{
 			map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": content}},
 		},
 	}
-	return "data: " + mustJSON(t, chunk) + "\n\ndata: [DONE]\n\n"
+	return "data: " + mustJSON(t, chunk) + "\n\n" + sseUsage(t, promptTokens, completionTokens)
 }
 
 // sseReasoning scripts an assistant reply that streams reasoning (thinking) text.
@@ -140,6 +159,25 @@ func sseReasoning(t *testing.T, reasoning string) string {
 	chunk := map[string]any{
 		"choices": []any{
 			map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "reasoning_content": reasoning}},
+		},
+	}
+	return "data: " + mustJSON(t, chunk) + "\n\n" + sseUsage(t, testPromptTokens, testCompletionTokens)
+}
+
+// sseUsage scripts the final stream chunk that carries token usage, which is what
+// providers send when the request asks for stream_options.include_usage.
+func sseUsage(t *testing.T, promptTokens, completionTokens int) string {
+	t.Helper()
+	chunk := map[string]any{
+		"choices": []any{},
+		"model":   "test-model",
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+			"completion_tokens_details": map[string]any{
+				"reasoning_tokens": 1,
+			},
 		},
 	}
 	return "data: " + mustJSON(t, chunk) + "\n\ndata: [DONE]\n\n"
@@ -178,6 +216,11 @@ func jsonReply(t *testing.T, reasoning, content string, calls ...scriptedToolCal
 		"object":  "chat.completion",
 		"created": 0,
 		"model":   "test-model",
+		"usage": map[string]any{
+			"prompt_tokens":     testPromptTokens,
+			"completion_tokens": testCompletionTokens,
+			"total_tokens":      testPromptTokens + testCompletionTokens,
+		},
 		"choices": []any{
 			map[string]any{"index": 0, "message": message, "finish_reason": finishReason},
 		},
@@ -186,6 +229,12 @@ func jsonReply(t *testing.T, reasoning, content string, calls ...scriptedToolCal
 
 // sseToolCalls scripts an assistant reply carrying tool calls.
 func sseToolCalls(t *testing.T, calls ...scriptedToolCall) string {
+	t.Helper()
+	return sseToolCallsWithUsage(t, testPromptTokens, testCompletionTokens, calls...)
+}
+
+// sseToolCallsWithUsage scripts a tool-calling reply with explicit token counts.
+func sseToolCallsWithUsage(t *testing.T, promptTokens, completionTokens int, calls ...scriptedToolCall) string {
 	t.Helper()
 	deltaCalls := make([]any, 0, len(calls))
 	for i, call := range calls {
@@ -211,7 +260,7 @@ func sseToolCalls(t *testing.T, calls ...scriptedToolCall) string {
 			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "tool_calls"},
 		},
 	}) + "\n\n")
-	b.WriteString("data: [DONE]\n\n")
+	b.WriteString(sseUsage(t, promptTokens, completionTokens))
 	return b.String()
 }
 

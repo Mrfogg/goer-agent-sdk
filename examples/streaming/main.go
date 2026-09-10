@@ -80,6 +80,9 @@ func main() {
 				inReasoning = false
 			}
 			fmt.Print(msg.Content)
+		case base.MsgTypeUsage:
+			fmt.Fprintf(os.Stderr, "\n[usage] input=%v output=%v total=%v\n",
+				msg.Data["prompt_tokens"], msg.Data["completion_tokens"], msg.Data["total_tokens"])
 		}
 	}
 
@@ -92,6 +95,8 @@ func main() {
 		os.Exit(1)
 	default:
 		fmt.Printf("\n\nfinal answer:\n%s\n", result.Answer)
+		fmt.Printf("tokens: input=%d output=%d over %d LLM calls\n",
+			result.Usage.PromptTokens, result.Usage.CompletionTokens, result.LLMCalls)
 	}
 }
 

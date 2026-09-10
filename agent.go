@@ -58,6 +58,7 @@ type BaseAgent struct {
 	model              string
 	reasoningEffort    string
 	outputMode         OutputMode
+	streamUsage        bool
 	lang               string
 	maxIterations      int
 	authToken          string
@@ -76,6 +77,8 @@ type BaseAgent struct {
 	runMu        sync.Mutex
 	running      bool
 	runResult    RunResult
+	runUsage     TokenUsage
+	llmCalls     int
 	agentHistory []openai.ChatCompletionMessage
 	cancelFunc   context.CancelFunc
 	memoryBlock  string
@@ -103,6 +106,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 		toolResultMaxBytes: defaultToolResultMaxBytes,
 		tools:              make(map[string]Tool),
 		endTools:           make(map[string]Tool),
+		streamUsage:        true,
 	}
 	agent.rebuildLLMClient()
 	agent.WithEndTools(endTools...)
@@ -171,6 +175,19 @@ func (a *BaseAgent) WithOutputMode(mode OutputMode) *BaseAgent {
 // OutputMode returns the configured output mode, defaulting to streaming.
 func (a *BaseAgent) OutputMode() OutputMode {
 	return a.outputModeOrDefault()
+}
+
+// WithStreamUsage controls whether streaming requests ask the provider for token
+// usage (stream_options.include_usage). It is enabled by default; disable it for
+// gateways that reject stream_options.
+func (a *BaseAgent) WithStreamUsage(enabled bool) *BaseAgent {
+	a.streamUsage = enabled
+	return a
+}
+
+// StreamUsage reports whether streaming requests ask for token usage.
+func (a *BaseAgent) StreamUsage() bool {
+	return a.streamUsage
 }
 
 func (a *BaseAgent) outputModeOrDefault() OutputMode {

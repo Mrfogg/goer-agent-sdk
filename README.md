@@ -136,10 +136,14 @@ func main() {
 			fmt.Print(msg.Content) // the model's thinking, streamed
 		case base.MsgTypeContent:
 			fmt.Print(msg.Content) // the answer text, streamed
+		case base.MsgTypeUsage:
+			fmt.Printf("\n[usage] input=%v output=%v\n", msg.Data["prompt_tokens"], msg.Data["completion_tokens"])
 		}
 	}
 
 	result := agent.Result()
+	fmt.Printf("tokens: input=%d output=%d over %d LLM calls\n",
+		result.Usage.PromptTokens, result.Usage.CompletionTokens, result.LLMCalls)
 	switch {
 	case result.Err != nil:
 		fmt.Println("\nfailed:", result.Err)
@@ -313,10 +317,12 @@ cancel() // or: agent.Stop()
 | --- | --- |
 | `reasoning` | the model's thinking (reasoning) text, streamed |
 | `content` | the answer text, streamed |
+| `usage` | token usage of one LLM call, in `Data` |
 
-Those are the only two types the runtime ever emits. There is no heartbeat, no start marker and
+Those are the only three types the runtime ever emits. There is no heartbeat, no start marker and
 no terminal event: the channel simply closes, and `Result()` then tells you how the run ended.
-The last `content` message is always the end tool's answer.
+The last `content` message is always the end tool's answer, and every LLM call that reports token
+usage adds one `usage` message.
 
 ### 8. Timeouts and cancellation
 
@@ -467,6 +473,10 @@ MODE=non_streaming go run ./examples/localmock # non-streaming
    `Result().Answer`.
 10. Output modes: `OutputModeStreaming` (default) and `OutputModeNonStreaming` emit the same two
     message types; they only differ in how often messages arrive.
+11. Every LLM call that reports token usage emits one `usage` message, and the run sums it into
+    `Result().Usage` with `Result().LLMCalls`. Streaming requests ask the provider for it with
+    `stream_options.include_usage`; `WithStreamUsage(false)` turns that off for gateways that
+    reject it.
 
 ### What the model actually receives
 
@@ -496,6 +506,7 @@ are skipped; at least one usable end tool is required.
 | `WithLang(lang)` | Pin the answer language |
 | `WithReasoningEffort(effort)` | Enable reasoning request fields |
 | `WithOutputMode(mode)` | `OutputModeStreaming` (default) or `OutputModeNonStreaming` |
+| `WithStreamUsage(enabled)` | Ask streaming providers for token usage (default on) |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | Register more end tools |
 | `WithMemory(module)` | Inject a memory module |
 | `WithPlanModule(module)` | Inject a plan module |
@@ -511,6 +522,7 @@ are skipped; at least one usable end tool is required.
 | `Run(ctx, input) (chan Msg, error)` | Start a run; the error reports a misuse such as a concurrent run |
 | `Result() RunResult` | The outcome of the finished run: `Answer`, `Stopped`, `Err` |
 | `OutputMode()` | The configured output mode (defaults to streaming) |
+| `StreamUsage()` | Whether streaming requests ask for token usage |
 | `Stop()` | Cancel the run (`Result().Stopped` becomes true) |
 | `WithHistory(history)` / `History()` | Seed / read the transcript (deep copies) |
 | `HasState()` | Whether history exists |
@@ -545,16 +557,28 @@ type Msg struct {
 
 type ToolEventEmitter func(Msg)
 
-// The two messages the runtime emits while a run is streaming.
+// The messages the runtime emits during a run.
 const (
 	MsgTypeReasoning = "reasoning" // the model's thinking text
 	MsgTypeContent   = "content"   // the answer text
+	MsgTypeUsage     = "usage"     // token usage of one LLM call, in Data
 )
 
 type RunResult struct {
-	Answer  string // final content returned by the end tool
-	Stopped bool   // the run was cancelled (Stop, ctx cancel or deadline)
-	Err     error  // failure reason
+	Answer   string     // final content returned by the end tool
+	Stopped  bool       // the run was cancelled (Stop, ctx cancel or deadline)
+	Err      error      // failure reason
+	Usage    TokenUsage // token usage summed over the run
+	LLMCalls int        // how many LLM calls reported usage
+}
+
+type TokenUsage struct {
+	PromptTokens     int    // input tokens
+	CompletionTokens int    // output tokens
+	TotalTokens      int
+	Model            string
+	CachedTokens     int    // optional, provider dependent
+	ReasoningTokens  int    // optional, provider dependent
 }
 
 type OutputMode string
@@ -605,6 +629,7 @@ carries `chat_id=`, and model output, tool arguments and results are clipped.
 | Answers come back in the wrong language | Set `WithLang("zh-CN")` — the language is only controlled by this option. |
 | Nothing shows up while the model is thinking | Only `reasoning` and `content` messages are emitted; if the model returns plain text without reasoning there is no early output, and the final answer only appears in `Result().Answer`. |
 | Text appears all at once instead of streaming | The agent is in `OutputModeNonStreaming`. Switch to `OutputModeStreaming` (the default), or leave `WithOutputMode` unset. |
+| No `usage` messages, or all token counts are zero | The provider or gateway does not return usage. Streaming requests opt in with `stream_options.include_usage`; if your gateway rejects that option, call `WithStreamUsage(false)` and read the numbers from the provider's own logs. |
 
 ---
 

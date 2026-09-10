@@ -12,7 +12,7 @@ too.
 
 | Example | What it shows | Needs an API key |
 | --- | --- | --- |
-| [quickstart](quickstart) | The smallest agent: one regular tool, one end tool, one turn, printing `reasoning` / `content` and the final answer. | yes |
+| [quickstart](quickstart) | The smallest agent: one regular tool, one end tool, one turn, printing `reasoning` / `content` / `usage` and the final answer with token counts. | yes |
 | [tools](tools) | A strict JSON schema (`OpenAIFunctionDefinition`), structured `ModelData` for the model, product events for the frontend (`ctxkey.ToolEventEmitter`), and validation inside the end tool. | yes |
 | [multiturn](multiturn) | A terminal REPL where each turn builds a fresh agent seeded with `WithHistory`, then stores the returned transcript. | yes |
 | [streaming](streaming) | Thinking and answer text rendered separately, plus cancellation: Ctrl+C or the deadline ends the run with `Result().Stopped`. | yes |
@@ -55,7 +55,7 @@ point; production code usually puts tools in their own packages.
 
 | 示例 | 演示内容 | 需要 API Key |
 | --- | --- | --- |
-| [quickstart](quickstart) | 最小可用 agent：一个普通工具 + 一个 end tool + 跑一轮，打印 `reasoning` / `content` 与最终答案。 | 需要 |
+| [quickstart](quickstart) | 最小可用 agent：一个普通工具 + 一个 end tool + 跑一轮，打印 `reasoning` / `content` / `usage` 以及带 token 统计的最终答案。 | 需要 |
 | [tools](tools) | 严格的 JSON Schema（`OpenAIFunctionDefinition`）、给模型的结构化 `ModelData`、给前端的产品事件（`ctxkey.ToolEventEmitter`），以及在 end tool 里做校验。 | 需要 |
 | [multiturn](multiturn) | 终端 REPL：每轮都用 `WithHistory` 注入上一轮历史新建 agent，结束后把 transcript 存回来。 | 需要 |
 | [streaming](streaming) | 思考内容与回答正文分开渲染；按 Ctrl+C 或超时取消 run，`Result().Stopped` 为 true。 | 需要 |

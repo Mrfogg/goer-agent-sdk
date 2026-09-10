@@ -24,6 +24,10 @@ type RunResult struct {
 	Stopped bool
 	// Err is the failure reason when the run did not finish on its own.
 	Err error
+	// Usage is the token usage of the run, summed over its LLM calls.
+	Usage TokenUsage
+	// LLMCalls is how many LLM calls reported usage during the run.
+	LLMCalls int
 }
 
 // Run starts one agent turn.
@@ -50,6 +54,8 @@ func (a *BaseAgent) Run(ctx context.Context, input string) (chan Msg, error) {
 
 	a.runMu.Lock()
 	a.cancelFunc = cancel
+	a.runUsage = TokenUsage{}
+	a.llmCalls = 0
 	a.runMu.Unlock()
 	a.setRunResult(RunResult{}) // a new run must not expose the previous outcome
 
@@ -62,7 +68,9 @@ func (a *BaseAgent) Run(ctx context.Context, input string) (chan Msg, error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				agentLogError(ctx, "run panicked: %v\n%s", recovered, debug.Stack())
-				a.setRunResult(RunResult{Err: fmt.Errorf("agent run panicked: %v", recovered)})
+				result := RunResult{Err: fmt.Errorf("agent run panicked: %v", recovered)}
+				result.Usage, result.LLMCalls = a.runUsageSnapshot()
+				a.setRunResult(result)
 			}
 			a.finishRun()
 		}()
@@ -118,16 +126,31 @@ func (a *BaseAgent) setRunResult(result RunResult) {
 	a.runResult = result
 }
 
+// addRunUsage accumulates the token usage of one LLM call.
+func (a *BaseAgent) addRunUsage(usage TokenUsage) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.runUsage = a.runUsage.plus(usage)
+	a.llmCalls++
+}
+
+func (a *BaseAgent) runUsageSnapshot() (TokenUsage, int) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	return a.runUsage, a.llmCalls
+}
+
 // failRun records a failed or cancelled run. Cancellation is reported through
 // RunResult.Stopped, everything else through RunResult.Err.
 func (a *BaseAgent) failRun(ctx context.Context, err error) {
+	usage, calls := a.runUsageSnapshot()
 	if isRunStopped(err) || ctx.Err() != nil {
 		agentLogInfo(ctx, "run stopped: %v", err)
-		a.setRunResult(RunResult{Stopped: true, Err: err})
+		a.setRunResult(RunResult{Stopped: true, Err: err, Usage: usage, LLMCalls: calls})
 		return
 	}
 	agentLogError(ctx, "run failed: %v", err)
-	a.setRunResult(RunResult{Err: err})
+	a.setRunResult(RunResult{Err: err, Usage: usage, LLMCalls: calls})
 }
 
 // runWithTools drives the tool-calling loop: every iteration is one assistant
@@ -186,6 +209,10 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 			a.failRun(ctx, err)
 			return
 		}
+		if response.Usage != nil {
+			emit(usageMessage(*response.Usage))
+			a.addRunUsage(*response.Usage)
+		}
 
 		assistantMessage := response.Message
 		assistantContent := strings.TrimSpace(assistantMessage.Content)
@@ -233,7 +260,8 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 		}
 
 		a.finalizeRun(ctx, answer, emit, iteration, fmt.Sprintf("end tool answer: tool=%s", endToolName))
-		a.setRunResult(RunResult{Answer: answer})
+		usage, calls := a.runUsageSnapshot()
+		a.setRunResult(RunResult{Answer: answer, Usage: usage, LLMCalls: calls})
 		return
 	}
 

@@ -88,6 +88,9 @@ func run() error {
 			fmt.Printf("[thinking] %s\n", msg.Content)
 		case base.MsgTypeContent:
 			fmt.Printf("[answer] %s\n", msg.Content)
+		case base.MsgTypeUsage:
+			fmt.Printf("[usage] input=%v output=%v total=%v\n",
+				msg.Data["prompt_tokens"], msg.Data["completion_tokens"], msg.Data["total_tokens"])
 		}
 	}
 
@@ -99,6 +102,8 @@ func run() error {
 		return result.Err
 	}
 	fmt.Println("\nfinal answer:", result.Answer)
+	fmt.Printf("tokens: input=%d output=%d over %d LLM calls\n",
+		result.Usage.PromptTokens, result.Usage.CompletionTokens, result.LLMCalls)
 	return nil
 }
 

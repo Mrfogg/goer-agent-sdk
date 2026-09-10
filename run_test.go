@@ -80,7 +80,7 @@ func TestNonStreamingModeEmitsOneMessagePerKind(t *testing.T) {
 	}
 }
 
-func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
+func TestOnlyReasoningContentAndUsageAreEmitted(t *testing.T) {
 	llm := newFakeLLM(
 		sseReasoning(t, "let me think about it"),
 		sseText(t, "the answer is 42"),
@@ -95,7 +95,9 @@ func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
 		t.Fatalf("run failed: %v", result.Err)
 	}
 	for _, msg := range msgs {
-		if msg.Type != MsgTypeReasoning && msg.Type != MsgTypeContent {
+		switch msg.Type {
+		case MsgTypeReasoning, MsgTypeContent, MsgTypeUsage:
+		default:
 			t.Fatalf("unexpected message type %q in %v", msg.Type, msgTypes(msgs))
 		}
 	}
@@ -119,6 +121,65 @@ func TestOnlyReasoningAndContentAreEmitted(t *testing.T) {
 		if msg.Type == MsgTypeReasoning && strings.Contains(msg.Content, "42") {
 			t.Fatalf("answer text leaked into the reasoning stream: %q", msg.Content)
 		}
+	}
+}
+
+func TestTokenUsageIsReportedPerLLMCall(t *testing.T) {
+	llm := newFakeLLM(
+		// First reply is text-only, so the run needs a second call to finish.
+		sseTextWithUsage(t, "thinking out loud", 10, 5),
+		sseToolCallsWithUsage(t, 20, 7, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
+	)
+	server := llm.start(t)
+	agent := startAgent(t, server)
+
+	msgs, result := collectRun(t, agent, "hi")
+
+	usages := messagesOfType(msgs, MsgTypeUsage)
+	if len(usages) != 2 {
+		t.Fatalf("usage messages = %d, want one per LLM call (%v)", len(usages), msgTypes(msgs))
+	}
+	if usages[0].Content != "" {
+		t.Fatalf("usage message must carry data only, got content %q", usages[0].Content)
+	}
+	if usages[0].Data["prompt_tokens"] != 10 || usages[0].Data["completion_tokens"] != 5 || usages[0].Data["total_tokens"] != 15 {
+		t.Fatalf("first usage = %v", usages[0].Data)
+	}
+	if usages[0].Data["model"] != "test-model" {
+		t.Fatalf("first usage model = %v", usages[0].Data["model"])
+	}
+	if usages[1].Data["prompt_tokens"] != 20 || usages[1].Data["completion_tokens"] != 7 {
+		t.Fatalf("second usage = %v", usages[1].Data)
+	}
+	if !llm.requestAt(t, 0).includeUsage {
+		t.Fatal("streaming requests must ask for token usage by default")
+	}
+
+	if result.Usage.PromptTokens != 30 || result.Usage.CompletionTokens != 12 || result.Usage.TotalTokens != 42 {
+		t.Fatalf("aggregated usage = %+v", result.Usage)
+	}
+	if result.Usage.ReasoningTokens != 2 {
+		t.Fatalf("aggregated reasoning tokens = %d, want 2", result.Usage.ReasoningTokens)
+	}
+	if result.LLMCalls != 2 {
+		t.Fatalf("llm calls = %d, want 2", result.LLMCalls)
+	}
+}
+
+func TestStreamUsageCanBeDisabled(t *testing.T) {
+	llm := newFakeLLM(sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}))
+	server := llm.start(t)
+	agent := startAgent(t, server).WithStreamUsage(false)
+
+	if agent.StreamUsage() {
+		t.Fatal("StreamUsage must report the configured value")
+	}
+	collectRun(t, agent, "hi")
+
+	// The option only controls the request; a provider that still sends usage is
+	// reported as usual.
+	if llm.requestAt(t, 0).includeUsage {
+		t.Fatal("stream usage was disabled but the request still asked for it")
 	}
 }
 

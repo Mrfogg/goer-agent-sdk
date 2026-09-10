@@ -54,6 +54,11 @@ const (
 	// carry the text accumulated so far, not just the last fragment.
 	MsgTypeReasoning = "reasoning"
 	MsgTypeContent   = "content"
+
+	// MsgTypeUsage reports the token usage of one LLM call. It carries no content:
+	// the numbers are in Data (prompt_tokens, completion_tokens, total_tokens and,
+	// when the provider reports them, model, cached_tokens, reasoning_tokens).
+	MsgTypeUsage = "usage"
 )
 
 func OpenAIToolDefinition(tool Tool) openai.Tool {

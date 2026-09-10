@@ -63,6 +63,8 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 type llmResponse struct {
 	Message      openai.ChatCompletionMessage
 	FinishReason openai.FinishReason
+	// Usage is nil when the provider did not report token accounting.
+	Usage *TokenUsage
 }
 
 // callLLMWithRetry performs one logical LLM call, retrying transport failures
@@ -123,6 +125,10 @@ func (a *BaseAgent) callLLM(ctx context.Context, messages []openai.ChatCompletio
 		request.Tools = tools
 		request.ToolChoice = toolChoice
 	}
+	if a.streamUsage {
+		// Ask the provider to report token usage on the last stream chunk.
+		request.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
+	}
 	if effort := a.reasoningEffort; effort != "" {
 		request.ReasoningEffort = effort
 		request.ChatTemplateKwargs = map[string]any{
@@ -166,6 +172,10 @@ func (a *BaseAgent) callLLMStream(ctx context.Context, client *openai.Client, re
 				break
 			}
 			return llmResponse{}, fmt.Errorf("failed to read LLM stream (model=%s): %w", model, recvErr)
+		}
+		if chunk.Usage != nil {
+			usage := tokenUsageFromOpenAI(*chunk.Usage, model)
+			response.Usage = &usage
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -226,6 +236,10 @@ func (a *BaseAgent) callLLMOnce(ctx context.Context, client *openai.Client, requ
 	response := llmResponse{
 		Message:      choice.Message,
 		FinishReason: choice.FinishReason,
+	}
+	if completion.Usage.TotalTokens > 0 || completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 {
+		usage := tokenUsageFromOpenAI(completion.Usage, model)
+		response.Usage = &usage
 	}
 	if reasoning := strings.TrimSpace(response.Message.ReasoningContent); reasoning != "" && onReasoning != nil {
 		onReasoning(reasoning)

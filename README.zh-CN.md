@@ -131,10 +131,14 @@ func main() {
 			fmt.Print(msg.Content) // 模型的思考内容，流式
 		case base.MsgTypeContent:
 			fmt.Print(msg.Content) // 回答正文，流式
+		case base.MsgTypeUsage:
+			fmt.Printf("\n[usage] input=%v output=%v\n", msg.Data["prompt_tokens"], msg.Data["completion_tokens"])
 		}
 	}
 
 	result := agent.Result()
+	fmt.Printf("tokens: input=%d output=%d over %d LLM calls\n",
+		result.Usage.PromptTokens, result.Usage.CompletionTokens, result.LLMCalls)
 	switch {
 	case result.Err != nil:
 		fmt.Println("\nfailed:", result.Err)
@@ -304,10 +308,11 @@ cancel() // 或者 agent.Stop()
 | --- | --- |
 | `reasoning` | 模型的思考（推理）内容，流式吐出 |
 | `content` | 回答正文，流式吐出 |
+| `usage` | 单次 LLM 调用的 token 用量，放在 `Data` 里 |
 
-运行时只会发这两种消息：没有心跳、没有开始标记、也没有终态事件——channel 关闭即 run 结束，
-之后用 `Result()` 拿结果。
-其中最后一条 `content` 一定是 end tool 给出的最终答案。
+运行时只会发这三种消息：没有心跳、没有开始标记、也没有终态事件——channel 关闭即 run 结束，
+之后用 `Result()` 拿结果。其中最后一条 `content` 一定是 end tool 给出的最终答案；
+每次 LLM 调用只要返回了用量，就会多一条 `usage` 消息。
 
 ### 8. 超时与取消
 
@@ -450,6 +455,7 @@ MODE=non_streaming go run ./examples/localmock # 非流式
 8. run 结束时 channel 关闭，结果只在 `Result()` 里：成功看 `Answer`，被取消看 `Stopped`，失败看 `Err`。
 9. end tool 的最终答案会作为最后一条 `content` 消息出现在流里，同时镜像到 `Result().Answer`。
 10. 输出模式：`OutputModeStreaming`（默认）与 `OutputModeNonStreaming` 发出的是同样两种消息，区别只是消息到达的频率。
+11. 每次 LLM 调用只要provider 返回了 token 用量，就会发一条 `usage` 消息，并累加到 `Result().Usage`，调用次数记在 `Result().LLMCalls`。流式请求通过 `stream_options.include_usage` 主动索要该字段，遇到不接受它的网关可以用 `WithStreamUsage(false)` 关掉。
 
 ### 模型实际收到的消息
 
@@ -477,6 +483,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `WithLang(lang)` | 强制回答语言 |
 | `WithReasoningEffort(effort)` | 开启 reasoning 请求参数 |
 | `WithOutputMode(mode)` | `OutputModeStreaming`（默认）或 `OutputModeNonStreaming` |
+| `WithStreamUsage(enabled)` | 流式请求是否索要 token 用量（默认开） |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | 追加 end tool |
 | `WithMemory(module)` | 注入记忆模块 |
 | `WithPlanModule(module)` | 注入计划模块 |
@@ -492,6 +499,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `Run(ctx, input) (chan Msg, error)` | 启动一轮 run；error 表示调用方式有问题（如并发调用） |
 | `Result() RunResult` | 已结束 run 的结果：`Answer` / `Stopped` / `Err` |
 | `OutputMode()` | 当前的输出模式（默认流式） |
+| `StreamUsage()` | 流式请求是否索要 token 用量 |
 | `Stop()` | 取消当前 run（`Result().Stopped` 会变成 true） |
 | `WithHistory(history)` / `History()` | 注入 / 读取 transcript（都是深拷贝） |
 | `HasState()` | 是否已有历史 |
@@ -526,16 +534,28 @@ type Msg struct {
 
 type ToolEventEmitter func(Msg)
 
-// 运行时只会发这两种消息
+// 运行时发出的消息类型
 const (
 	MsgTypeReasoning = "reasoning" // 模型的思考内容
 	MsgTypeContent   = "content"   // 回答正文
+	MsgTypeUsage     = "usage"     // 单次调用的 token 用量，放在 Data 里
 )
 
 type RunResult struct {
-	Answer  string // end tool 返回的最终内容
-	Stopped bool   // 是否被取消（Stop / ctx 取消 / 超时）
-	Err     error  // 失败原因
+	Answer   string     // end tool 返回的最终内容
+	Stopped  bool       // 是否被取消（Stop / ctx 取消 / 超时）
+	Err      error      // 失败原因
+	Usage    TokenUsage // 整个 run 累加的 token 用量
+	LLMCalls int        // 有多少次 LLM 调用报了用量
+}
+
+type TokenUsage struct {
+	PromptTokens     int // 输入 token
+	CompletionTokens int // 输出 token
+	TotalTokens      int
+	Model            string
+	CachedTokens     int // 可选，取决于 provider
+	ReasoningTokens  int // 可选，取决于 provider
 }
 
 type OutputMode string
@@ -586,6 +606,7 @@ xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / inf
 | 回答语言不对 | 用 `WithLang("zh-CN")`，语言只由这个选项控制。 |
 | 模型思考时前端没有任何输出 | 运行时只发 `reasoning` 和 `content`；模型没有推理内容时中途就没有输出，最终答案只在 `Result().Answer` 里。 |
 | 内容是一次性出现的、没有流式效果 | agent 处于 `OutputModeNonStreaming`。改成 `OutputModeStreaming`（默认）即可，或干脆不调用 `WithOutputMode`。 |
+| 没有 `usage` 消息，或 token 数量全是 0 | provider/网关没有返回用量。流式请求通过 `stream_options.include_usage` 主动索要；如果网关不接受该参数，用 `WithStreamUsage(false)` 关掉，再从业侧日志里取用量。 |
 
 ---
 
