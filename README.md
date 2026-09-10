@@ -2,258 +2,415 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-A small, model-agnostic agent runtime. `BaseAgent` drives any OpenAI-compatible chat
-model through a tool-calling loop until one of its **end tools** succeeds.
+Turn any OpenAI-compatible chat model into a **tool-using agent** that can only report success
+through a tool you control.
 
-The design takes one position and holds it: **only an end tool can finish a run.** A
-text-only reply never ends a run — the model has to hand the task over by calling a tool.
-That keeps completion logic (validation, producing the final content, deciding to retry)
-inside the tool, while the runtime only owns the loop, the events and the transcript.
+You register tools, the model calls them in a loop, and the run ends the moment one of your
+**end tools** returns success. A text-only reply never ends a run — so "is the task done?" is
+answered by your code, not by the model's prose.
 
----
+```go
+agent := base.NewBaseAgent(
+	"report-agent", "Generates reports", systemPrompt,
+	"gpt-4o", os.Getenv("LLM_TOKEN"), os.Getenv("LLM_BASE_URL"),
+	finishTool{}, // end tool: the only way this run can finish
+)
+agent.AddTool(aggregateTool{}) // regular tools the model may call along the way
 
-## 1. Core concepts
-
-| Concept | Description |
-| --- | --- |
-| `BaseAgent` | One agent instance = one conversation turn. Holds a transcript and runs one `Run`. |
-| `Tool` | `Name` / `Description` / `Execute`; registered on the agent and exposed to the model as an OpenAI function. |
-| **end tool** | The termination tool required by the constructor. Success ends the run; failure keeps it going. |
-| `Msg` | Events the runtime emits to the caller (progress, heartbeat, terminal state, …). |
-| `ToolResult` | What a tool returns, split into model context (`ModelContent`/`ModelData`) and product events (`Events`). |
-| `MemoryModule` | Optional module: registers tools and appends a memory block to the system prompt. |
-| `PlanModule` | Optional module: registers a tool, appends a prompt section, resets per run, validates before finishing. |
-
-One run looks like this:
-
-```
-Run(ctx, input)
-  └─ loop (66 turns by default)
-       ├─ assemble messages (system prompt + language rule + memory block + end-tool rule + transcript)
-       ├─ stream the LLM call (3 attempts with backoff on transport failure)
-       ├─ assistant reply has no tool_calls → corrective message, continue
-       │                                    (after 2 in a row, force tool_choice=required)
-       └─ assistant reply has tool_calls → execute them in order
-            ├─ end tool called and succeeded → finish, emit the final content (run_done)
-            ├─ end tool called but failed  → keep looping
-            └─ regular tool                → write result back to the transcript, keep looping
+for msg := range agent.Run(ctx, "Summarize this sheet") {
+	if msg.Type == base.MsgTypeRunDone {
+		fmt.Println(msg.Content) // the content your finish tool returned
+	}
+}
 ```
 
 ---
 
-## 2. Layout
-
-Module `github.com/excelmatic/goer-agent-sdk`; the root package is `base` (sub-packages
-`ctxkey` and `xlog`).
-
-| File | Responsibility |
-| --- | --- |
-| `agent.go` | `Agent` interface, `BaseAgent` struct, constructor, all `With*` options, tool registration |
-| `run.go` | `Run` / `Stop`, the main loop, run lifecycle (concurrency guard, terminal events), plan validation |
-| `toolcall.go` | Executing one turn's tool calls, end-tool decision, skipped-call placeholders, tool context |
-| `llm.go` | LLM client construction, streaming call and delta merging, retry/backoff, tool schema, message sanitizing |
-| `prompt.go` | System prompt assembly and every prompt template, stop message |
-| `history.go` | Transcript read/write (deep copies), tool-result serialization and size cap |
-| `events.go` | Event delivery (cancellable / bounded for terminal events), heartbeat |
-| `log.go` | Logging with `chat_id`, JSON compaction and text clipping for logs |
-| `constants.go` | All runtime defaults (iteration cap, buffer, retries, thresholds, …) |
-| `tool.go` | `Tool`/`ToolResult`/`Msg`/`ToolEventEmitter`, `MsgType*` constants, OpenAI schema helpers |
-| `summary.go` | `SummarizeMessages`: turns one run's events into answer / visible content / dashboard HTML |
-| `attachment.go` | Product-facing message conventions (chart attachments, task_completed records) |
-| `skill.go` | **Not wired up yet**: `Skill`/`BaseSkill`, see "Known limitations" |
-| `ctxkey/` | Context keys tools read: `ChatID`, `AgentHistory`, `ToolEventEmitter` |
-| `xlog/` | Tiny leveled logger, `info` by default, `SetLevel` to change |
-| `*_test.go` | Unit tests plus end-to-end run tests against a local `httptest` fake LLM |
-
----
-
-## 3. Dependency: the `replace` directive is mandatory
-
-The SDK needs `ChatCompletionRequest.ExtraBody` and the OpenAI-style `reasoning` field,
-which only exist in the `github.com/neugls/go-openai` fork. That fork still declares the
-upstream module path, so the only way to select it is a `replace` directive:
+## Installation
 
 ```
+go get github.com/excelmatic/goer-agent-sdk
+```
+
+### Required: the `replace` directive
+
+This SDK needs two things that upstream `go-openai` does not have yet: a top-level `ExtraBody`
+map on the request (`thinking` / `reasoning` fields for reasoning models), and the
+OpenAI-style `reasoning` field when parsing replies. Both live in a fork, and that fork still
+declares the upstream module path — so the only way to select it is a `replace` directive.
+
+Add this to the `go.mod` of **every module that imports the SDK**:
+
+```
+require github.com/sashabaranov/go-openai v1.42.0
+
 replace github.com/sashabaranov/go-openai => github.com/neugls/go-openai v1.42.0-reasoning-extra-body
 ```
 
-**`replace` directives are not inherited.** Every module that imports this SDK must repeat
-that line in its own `go.mod`; otherwise Go resolves upstream `sashabaranov/go-openai` and
-the build fails on the missing `ExtraBody` / `reasoning` fields. If the SDK directory is not
-inside the same repository, a second line is needed:
-`replace github.com/excelmatic/goer-agent-sdk => ../goer-agent-sdk`.
+Why it matters, in practice:
 
-Long term: publish the fork under its own module path (e.g. `github.com/excelmatic/go-openai`),
-or upstream the two capabilities.
+- **Skip it and the build breaks**, and not at runtime: the compiler reports unknown field
+  `ExtraBody` / `ReasoningContent` in `llm.go`.
+- **Go ignores the `replace` directives of dependencies**: having it in this repository's
+  `go.mod` does not help consumers — each consumer copies the two lines above.
+- **If the SDK lives next to your code instead of on GitHub**, also add
+  `replace github.com/excelmatic/goer-agent-sdk => ../goer-agent-sdk`.
+- **The fork must be reachable** (public, or authenticated) for your CI as well, because
+  `go mod download` fetches it on a clean machine.
+
+If your gateway does not need the reasoning fields at all, you can avoid `WithReasoningEffort`
+and depend on upstream `go-openai` yourself — but the published SDK source expects the fork.
+
+Requirements: Go 1.23+.
 
 ---
 
-## 4. Getting started
+## Quick start
 
-> In the examples, `base` is this SDK and `ctxkey` is its sub-package:
->
-> ```go
-> import (
-> 	base   "github.com/excelmatic/goer-agent-sdk"
-> 	"github.com/excelmatic/goer-agent-sdk/ctxkey"
-> 	"github.com/sashabaranov/go-openai"
-> )
-> ```
-
-### 4.1 Write an end tool
+A complete program: one regular tool, one end tool, one turn.
 
 ```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	base "github.com/excelmatic/goer-agent-sdk"
+)
+
+// 1. A regular tool: the model may call it while working.
+type rowsTool struct{}
+
+func (rowsTool) Name() string        { return "count_rows" }
+func (rowsTool) Description() string { return "Count the rows of the current sheet" }
+
+func (rowsTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
+	// ModelContent is what the model sees on its next turn.
+	return base.ToolResult{Success: true, ModelContent: "120 rows"}, nil
+}
+
+// 2. The end tool: success here is what finishes the run.
 type finishTool struct{}
 
 func (finishTool) Name() string        { return "finish" }
-func (finishTool) Description() string { return "Call when the task is complete and submit the final answer" }
+func (finishTool) Description() string { return "Submit the final answer when the task is complete" }
 
-// Implement OpenAIFunctionProvider for a custom JSON schema:
-//   func (finishTool) OpenAIFunctionDefinition() *openai.FunctionDefinition { ... }
 func (finishTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	answer, _ := args["answer"].(string)
 	if strings.TrimSpace(answer) == "" {
-		// Validation failed → return a failure; the run feeds it back to the model and continues
+		// A failure keeps the run going: the model sees this error and retries.
 		return base.ToolResult{Success: false, Error: "answer is required"}, nil
+	}
+	return base.ToolResult{Success: true, ModelContent: answer}, nil
+}
+
+func main() {
+	agent := base.NewBaseAgent(
+		"report-agent",
+		"Agent that summarises spreadsheets",
+		"You are a data analyst. Use the tools, then call finish with the final answer.",
+		"gpt-4o",
+		os.Getenv("LLM_TOKEN"),    // auth token
+		os.Getenv("LLM_BASE_URL"), // base URL, e.g. https://api.openai.com/v1
+		finishTool{},
+	)
+	agent.AddTool(rowsTool{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for msg := range agent.Run(ctx, "How many rows does this sheet have?") {
+		switch msg.Type {
+		case base.MsgTypeProgressUpdate:
+			fmt.Print(msg.Content) // streaming delta
+		case base.MsgTypeRunDone:
+			fmt.Println("\nanswer:", msg.Content)
+		case base.MsgTypeRunError:
+			fmt.Println("\nerror:", msg.Content)
+		case base.MsgTypeRunStopped:
+			fmt.Println("\nstopped:", msg.Content)
+		}
+	}
+}
+```
+
+What happens at runtime:
+
+1. the model replies with a tool call (`count_rows` or `finish`);
+2. regular tool results go back into the transcript and the loop continues;
+3. a successful `finish` ends the run: you get `markdown` with the answer, then `run_done`;
+4. if the model answers with prose only, the runtime sends it back with a corrective message.
+
+---
+
+## Usage recipes
+
+### 1. Several tools, one hand-off
+
+Most agents are "do the work with regular tools, then hand the result to an end tool".
+
+```go
+agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, token, baseURL, finishTool{})
+agent.AddTool(queryTool{})     // reads data
+agent.AddTool(aggregateTool{}) // computes
+agent.AddTool(chartTool{})     // renders
+```
+
+Describe the hand-off in your system prompt ("work with the other tools, then call `finish`").
+The runtime also appends the rule itself, per request:
+
+> END-TOOL MODE (MANDATORY) — End tools: [finish]. Only a successful call to one of these tools
+> can finish this run; a text-only answer never ends the run and will be sent back to you.
+
+### 2. Validate inside the end tool
+
+The end tool is the only gate, so quality checks belong there. Returning a failure is how you
+say "not good enough, keep working".
+
+```go
+func (finishTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
+	answer, _ := args["answer"].(string)
+	if !strings.Contains(answer, "|") {
+		// The model sees this text and fixes the answer on the next turn.
+		return base.ToolResult{Success: false, Error: "answer must contain a markdown table"}, nil
+	}
+	if len(answer) > 8000 {
+		return base.ToolResult{Success: false, Error: "answer is too long, summarise it"}, nil
 	}
 	return base.ToolResult{Success: true, ModelContent: answer}, nil
 }
 ```
 
-> Validation belongs here. An end tool decides whether the task is done: success finishes the
-> run, failure keeps it going. There is no separate "final answer validator" hook.
+### 3. Return structured results to the model
 
-### 4.2 Run it
+`ModelContent` is free text, `ModelData` is structured; both enter the model context.
 
 ```go
-agent := base.NewBaseAgent(
-	"report-agent",                 // name
-	"Agent that generates reports", // description
-	"You are a data analyst...",    // system prompt
-	"gpt-4o",                       // model
-	os.Getenv("LLM_TOKEN"),         // auth token
-	os.Getenv("LLM_BASE_URL"),      // base URL; empty falls back to the library default
-	finishTool{},                   // required: at least one end tool
-)
-
-agent.WithEndTools(abortTool{})              // optional: register more end tools
-agent.WithModel("gpt-4.1")                   // optional: override the model
-agent.WithLang("zh-CN")                      // optional: pin the answer language
-agent.WithReasoningEffort("medium")          // optional: enable reasoning request fields
-agent.WithToolResultMaxBytes(128 * 1024)     // optional: cap one tool result entering the context
-agent.WithHTTPClient(httpClient)             // optional: custom transport / proxy
-agent.WithHTTPHeaders(map[string]string{     // optional: extra headers for a gateway
-	"X-OpenRouter-Title": "excelmatic",
-})
-agent.WithMemory(memoryModule)               // optional: memory module
-agent.WithPlanModule(planModule)             // optional: plan module
-agent.SetMaxIterations(40)                   // optional: turn cap for a single run
-
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-for msg := range agent.Run(ctx, "summarize this sheet for me") {
-	switch msg.Type {
-	case base.MsgTypeProgressUpdate:
-		// streaming delta, forward to your frontend if you like
-	case base.MsgTypeMarkdown:
-		// final answer
-	case base.MsgTypeRunDone:
-		fmt.Println("answer:", msg.Content)
-	case base.MsgTypeRunError:
-		fmt.Println("error:", msg.Content)
-	case base.MsgTypeRunStopped:
-		fmt.Println("stopped:", msg.Content)
-	}
-}
-
-history := agent.History() // persist this yourself
+return base.ToolResult{
+	Success:      true,
+	ModelContent: "query finished: 120 rows, 3 columns",
+	ModelData: map[string]any{
+		"rows":    120,
+		"columns": []string{"date", "region", "amount"},
+	},
+}, nil
 ```
 
-### 4.3 Emit events and read context from a tool
+### 4. Emit product events and report the user's language
+
+Tools push events to your frontend without polluting the model context:
 
 ```go
+import "github.com/excelmatic/goer-agent-sdk/ctxkey"
+
 func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
-	// 1) Emit a product event (this does NOT enter the model context)
+	option := buildChartOption(args) // your code
+
 	if emit, ok := ctx.Value(ctxkey.ToolEventEmitter).(base.ToolEventEmitter); ok {
-		emit(base.Msg{Type: base.MsgTypeChartResult, Data: map[string]any{
-			"chart_id":     "sales",
-			"chart_option": option,
-		}})
+		emit(base.Msg{
+			Type: base.MsgTypeChartResult,
+			Data: map[string]any{"chart_id": "sales", "chart_option": option},
+		})
 	}
 
-	// 2) Read the current transcript (a copy; you cannot mutate runtime state)
-	history, _ := ctx.Value(ctxkey.AgentHistory).([]openai.ChatCompletionMessage)
-	_ = history
-
-	// 3) Tell the runtime which language the user wrote in; later turns answer in it
 	return base.ToolResult{
 		Success:      true,
-		ModelContent: "chart generated",             // enters the model context
-		ModelData:    map[string]any{"rows": 120},   // enters the model context (structured)
-		Meta:         map[string]any{base.ToolMetaUserQueryLanguageKey: "zh-CN"},
+		ModelContent: "chart generated",
+		// The runtime switches the answer language for this and later turns.
+		Meta: map[string]any{base.ToolMetaUserQueryLanguageKey: "zh-CN"},
 	}, nil
 }
 ```
 
----
+### 5. Custom JSON schema, and reading the transcript
 
-## 5. Run contract
-
-1. **The constructor requires at least one end tool**; it panics otherwise.
-2. **Only a successful end-tool call finishes a run.** A text-only reply gets a corrective
-   message and the loop continues.
-3. An end tool that returns `Success=false` or an error does not finish the run; its result is
-   fed back to the model.
-4. Two consecutive text-only replies force `tool_choice=required` on the next request; five in
-   a row fail the run with `run_error`.
-5. Tool calls queued after an end tool in the same turn are not executed, but they still get a
-   placeholder "skipped" result so every `tool_calls` entry has a matching tool message
-   (otherwise the next request would be rejected with HTTP 400 by OpenAI-compatible APIs).
-6. LLM transport failures retry three times with 500ms → 1s backoff; the cause is preserved in
-   the `run_error` via `%w`.
-7. A panicking tool is recovered into a `run_error`; the process survives and the run slot is
-   always released.
-8. The channel returned by `Run` is closed after the terminal event, which is always one of
-   `run_done`, `run_error` or `run_stopped`.
-9. Event delivery is cancelled with the run context; terminal events have a 5s fallback
-   delivery, so a consumer that stops reading cannot leak the run goroutine.
-
-### Messages sent to the model are sanitized
-
-`sanitizeMessagesForLLM` applies three provider-compatibility tweaks before sending: it clears
-every `Name`, replaces an empty `Content` with a single space, and replaces an empty
-`ReasoningContent` with a single space. The in-memory transcript and the wire payload therefore
-differ slightly.
-
----
-
-## 6. Events and terminal states
-
-| Event | When | Key fields |
-| --- | --- | --- |
-| `start` | the run begins | — |
-| `progress_update` | streaming answer / reasoning delta | `Content` |
-| `heartbeat` | every 1s (dropped when the consumer lags) | `Data["timestamp"]` |
-| `markdown` | the final answer is emitted | `Content` |
-| `run_done` | terminal: success | `Content` and `Data["answer"]` |
-| `run_error` | terminal: failure | `Content` holds the reason |
-| `run_stopped` | terminal: `Stop()` or ctx cancellation | `Content` is the stop message, `Data["reason"]` the cause |
-
-Tools may also emit product events: `chart_result`, `task_completed`, `dashboard_html`,
-`report_start`, `report_end`. `SummarizeMessages` folds a run's events into a persistable
-record:
+By default a tool's arguments schema is "any JSON object". Implement `OpenAIFunctionProvider`
+for a strict schema:
 
 ```go
-summary := base.SummarizeMessages(msgs)
-summary.Answer         // final answer (visible content wins when present)
-summary.VisibleContent // markdown / task_completed / chart attachments / stop message
-summary.HtmlContent    // dashboard_html
+func (finishTool) OpenAIFunctionDefinition() *openai.FunctionDefinition {
+	return &openai.FunctionDefinition{
+		Name:        "finish",
+		Description: "Submit the final answer",
+		Parameters: base.OpenAIObjectSchema(map[string]jsonschema.Definition{
+			"answer": base.OpenAIStringSchema("Final answer in markdown"),
+		}, "answer"),
+	}
+}
 ```
+
+Tools also receive the transcript as it was when the tool started (a copy):
+
+```go
+history, _ := ctx.Value(ctxkey.AgentHistory).([]openai.ChatCompletionMessage)
+```
+
+### 6. Multi-turn conversation
+
+One agent instance per turn; persistence is yours.
+
+```go
+agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, token, baseURL, finishTool{}).
+	WithHistory(loadHistory(chatID)) // []openai.ChatCompletionMessage from your store
+
+for msg := range agent.Run(ctx, userInput) {
+	forward(msg)
+}
+
+saveHistory(chatID, agent.History()) // returns a copy, safe to keep
+```
+
+Store `role`, `content`, `tool_calls` and `tool_call_id` verbatim — see the FAQ about HTTP 400.
+
+### 7. Stream to a frontend with a stop button
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+stream := agent.Run(ctx, userInput)
+
+go func() {
+	for msg := range stream {
+		forward(msg) // your websocket / SSE writer
+	}
+	closeClientStream()
+}()
+
+// ... user pressed "stop"
+cancel() // or: agent.Stop()
+```
+
+| Event | Meaning |
+| --- | --- |
+| `start` | the run began |
+| `progress_update` | streaming answer / reasoning delta |
+| `heartbeat` | the run is alive (every second) |
+| `markdown` | the final answer text |
+| `run_done` / `run_error` / `run_stopped` | the run is over; the channel closes next |
+
+### 8. Timeouts and cancellation
+
+Give the run a deadline; when it fires you get `run_stopped`, not `run_error`.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+defer cancel()
+```
+
+Avoid `http.Client.Timeout` when you stream long answers — it bounds the whole response body.
+Prefer the context deadline, and use `WithHTTPClient` only for transports and proxies.
+
+### 9. Point at another gateway
+
+```go
+agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, apiKey, "https://my-gateway/v1", finishTool{}).
+	WithHTTPHeaders(map[string]string{
+		"X-OpenRouter-Title": "excelmatic",
+		"HTTP-Referer":       "https://excelmatic.com",
+	}).
+	WithHTTPClient(&http.Client{Transport: myProxyTransport})
+```
+
+`baseURL` is passed verbatim to the client; an empty string keeps the library default endpoint.
+
+### 10. Reasoning models
+
+```go
+agent.WithReasoningEffort("medium") // sends reasoning_effort + thinking/reasoning body fields
+```
+
+Reasoning deltas are streamed as `progress_update` as well. Pass an empty string to disable it.
+
+### 11. Memory and plan modules
+
+```go
+type myMemory struct{}
+
+func (myMemory) Tools() []base.Tool { return []base.Tool{rememberTool{}, recallTool{}} }
+
+func (myMemory) BuildPromptBlock(ctx context.Context) string {
+	return "Known about this user:\n- works in finance" // appended to the system prompt
+}
+
+agent.WithMemory(myMemory{})
+agent.WithPlanModule(myPlan{}) // Tool() + Prompt() + Reset() + ValidateFinalAnswer()
+```
+
+When a plan module is registered: its tool is registered, its prompt section is appended,
+`Reset()` runs at the start of every run, and `ValidateFinalAnswer(ctx)` runs just before the
+answer is emitted (a failing validation auto-completes the pending tasks and emits an event).
+
+### 12. Keep the context small
+
+```go
+agent.WithToolResultMaxBytes(128 * 1024) // oversized tool results become a clipped payload
+agent.SetMaxIterations(40)               // cap turns per run (default 66)
+
+// trim history yourself before the next turn:
+agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
+```
+
+### 13. Persist a run
+
+```go
+var msgs []base.Msg
+for msg := range agent.Run(ctx, input) {
+	msgs = append(msgs, msg)
+	forward(msg)
+}
+
+summary := base.SummarizeMessages(msgs)
+db.SaveTurn(chatID, summary.Answer, summary.VisibleContent, agent.History())
+```
+
+`summary.VisibleContent` is the markdown / task-completed / chart / stop text the user actually
+saw; `summary.HtmlContent` carries the dashboard payload when a run produced one.
+
+### 14. Use it inside an HTTP handler
+
+```go
+func handle(w http.ResponseWriter, r *http.Request) {
+	agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, token, baseURL, finishTool{}).
+		WithHistory(loadHistory(chatID)) // per-request instance: no shared state
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	for msg := range agent.Run(ctx, r.FormValue("input")) {
+		writeEvent(w, msg)
+	}
+	saveHistory(chatID, agent.History())
+}
+```
+
+One instance handles one run. A concurrent second `Run` returns a `run_error` reading
+`agent is already running: one BaseAgent instance handles a single run at a time`.
 
 ---
 
-## 7. API reference
+## Behavior rules
+
+1. The constructor requires at least one end tool — it panics otherwise.
+2. Only a successful end-tool call finishes a run; text-only replies are sent back to the model.
+3. A failing end tool (`Success=false`, or a non-nil error) does not finish the run.
+4. Two consecutive text-only replies force `tool_choice=required`; five in a row fail the run.
+5. Tool calls queued behind an end tool in the same turn are recorded as "skipped" placeholders,
+   so the transcript stays valid for the next request.
+6. LLM transport failures retry three times (500ms → 1s), then fail with the cause preserved.
+7. A panicking tool becomes a `run_error`; the process survives and the run slot is released.
+8. The channel closes after exactly one terminal event: `run_done`, `run_error` or `run_stopped`.
+
+### What the model actually receives
+
+`sanitizeMessagesForLLM` clears every message `Name`, and replaces empty `Content` /
+`ReasoningContent` with a single space (several providers reject empty strings). The in-memory
+transcript and the wire payload therefore differ slightly.
+
+---
+
+## API reference
 
 ### Constructor
 
@@ -261,43 +418,36 @@ summary.HtmlContent    // dashboard_html
 func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL string, endTools ...Tool) *BaseAgent
 ```
 
-An empty `baseURL` keeps the library default endpoint. At least one usable end tool is required
-(`nil` tools and tools with an empty name are skipped).
+An empty `baseURL` keeps the library default endpoint. `nil` tools and tools with an empty name
+are skipped; at least one usable end tool is required.
 
-### Options (all return `*BaseAgent`, chainable)
+### Options (chainable)
 
 | Method | Effect |
 | --- | --- |
 | `WithModel(model)` | Override the model |
 | `WithSystemPrompt(prompt)` | Replace the base system prompt |
-| `WithLang(lang)` | Pin the answer language (added to the system prompt) |
-| `WithReasoningEffort(effort)` | Enable reasoning request fields; empty string disables |
+| `WithLang(lang)` | Pin the answer language |
+| `WithReasoningEffort(effort)` | Enable reasoning request fields |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | Register more end tools |
-| `WithMemory(module)` | Inject a memory module (tools + memory block) |
-| `WithPlanModule(module)` | Inject a plan module (tool + prompt + per-run reset + final validation) |
-| `WithHTTPClient(client)` | Custom HTTP client (proxy, transport, pool) |
-| `WithHTTPHeaders(headers)` | Extra headers on every LLM request |
-| `WithToolResultMaxBytes(n)` | Cap one tool result entering the context; `0` disables |
-| `SetMaxIterations(n)` | Turn cap for a single run (default 66) |
+| `WithMemory(module)` | Inject a memory module |
+| `WithPlanModule(module)` | Inject a plan module |
+| `WithHTTPClient(client)` | Custom HTTP client (proxy / transport) |
+| `WithHTTPHeaders(headers)` | Extra headers on every request |
+| `WithToolResultMaxBytes(n)` | Cap one tool result entering the context (`0` disables) |
+| `SetMaxIterations(n)` | Turn cap per run (default 66) |
 
-### Running
-
-| Method | Description |
-| --- | --- |
-| `Run(ctx, input) chan Msg` | Start a run and return the event channel; drain it until closed |
-| `Stop()` | Cancel the current run; the caller receives `run_stopped` |
-
-### History and introspection
+### Running, history, tools
 
 | Method | Description |
 | --- | --- |
-| `WithHistory(history)` | Seed the previous transcript (**deep copy**) |
-| `History()` | Read the current transcript (**returns a copy**) |
-| `HasState()` | Whether history exists already |
-| `AddTool(tool)` | Register a regular tool (`nil`/unnamed are ignored) |
-| `GetTool(name)` / `GetTools()` | Look up tools (`GetTools` returns a copy) |
-| `EndToolNames()` | Sorted names of the end tools |
-| `Name()` / `Description()` / `SystemPrompt()` / `Lang()` | Basic metadata |
+| `Run(ctx, input) chan Msg` | Start a run; drain the channel until it closes |
+| `Stop()` | Cancel the run (terminal event: `run_stopped`) |
+| `WithHistory(history)` / `History()` | Seed / read the transcript (deep copies) |
+| `HasState()` | Whether history exists |
+| `AddTool(tool)` / `GetTool(name)` / `GetTools()` | Tool registry (`GetTools` returns a copy) |
+| `EndToolNames()` | Sorted end-tool names |
+| `Name()` / `Description()` / `SystemPrompt()` / `Lang()` | Metadata |
 
 ### Key types
 
@@ -309,12 +459,12 @@ type Tool interface {
 }
 
 type ToolResult struct {
-	Success      bool            // end tool success is what finishes a run
-	Error        string          // failure reason (enters the model context)
-	Meta         map[string]any  // runtime-recognized metadata, e.g. user_query_language
-	ModelContent string          // content entering the model context
-	ModelData    map[string]any  // structured data entering the model context
-	Events       []Msg           // product-facing events, not sent to the model
+	Success      bool            // end tool success finishes the run
+	Error        string          // failure reason shown to the model
+	Meta         map[string]any  // runtime metadata, e.g. user_query_language
+	ModelContent string          // enters the model context
+	ModelData    map[string]any  // enters the model context (structured)
+	Events       []Msg           // sent to your frontend only
 }
 
 type Msg struct {
@@ -327,115 +477,77 @@ type Msg struct {
 type ToolEventEmitter func(Msg)
 ```
 
-### Runtime defaults (`constants.go`)
+### Runtime defaults
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `defaultMaxIterations` | 66 | Assistant turns allowed per run |
-| `eventChannelBuffer` | 256 | Buffer of the channel returned by `Run` |
-| `finalEventDeliveryTimeout` | 5s | Fallback delivery timeout for terminal events |
-| `heartbeatInterval` | 1s | Heartbeat interval |
-| `logContentMaxRunes` | 2000 | Content clipping length in logs |
-| `defaultToolResultMaxBytes` | 256 KiB | Cap for one tool result entering the context |
+| `defaultMaxIterations` | 66 | Assistant turns per run |
+| `defaultToolResultMaxBytes` | 256 KiB | Cap per tool result |
 | `noToolCallEscalateAfter` | 2 | Text-only replies before forcing `tool_choice=required` |
 | `noToolCallFailAfter` | 5 | Text-only replies before failing the run |
 | `llmMaxAttempts` | 3 | Attempts per LLM call |
 | `llmRetryBaseDelay` / `llmRetryMaxDelay` | 500ms / 5s | Backoff bounds |
+| `heartbeatInterval` | 1s | Heartbeat interval |
+| `eventChannelBuffer` | 256 | Buffer of the channel returned by `Run` |
+| `logContentMaxRunes` | 2000 | Log clipping length |
 
----
-
-## 8. History and persistence
-
-The SDK owns **state for the duration of a run only**; persisting it across turns is the
-caller's job (database, Redis, whatever fits):
+### Logging
 
 ```go
-// after a run
-save(chatID, agent.History())
-
-// before the next run
-agent := base.NewBaseAgent(..., finishTool{}).WithHistory(load(chatID))
+xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / info / warn / error / off
 ```
 
-Prefer "one conversation turn = one agent instance". When storing history, keep `role`,
-`content`, `tool_calls` and `tool_call_id` intact: a transcript with an assistant `tool_calls`
-entry but no matching tool results is rejected with HTTP 400 by OpenAI-compatible APIs on the
-next request (the in-run "skipped" placeholders only protect a single run).
-
-`AgentContextSnapshot` offers a serializable shape:
-
-```go
-type AgentContextSnapshot struct {
-	History []openai.ChatCompletionMessage `json:"history,omitempty"`
-}
-```
-
-Context only grows; for long conversations trim it yourself, or put the trimming policy in a
-`MemoryModule`.
+`info` by default. `logMessageSizes` (per-request size and token estimate) is `debug`. Every line
+carries `chat_id=`, and model output, tool arguments and results are clipped.
 
 ---
 
-## 9. Concurrency model
+## Troubleshooting
 
-`BaseAgent` holds run-scoped state (transcript, language, memory block, cancel func), so:
-
-- **one run at a time**: a concurrent `Run` immediately returns a `run_error` reading
-  `"agent is already running: one BaseAgent instance handles a single run at a time"`;
-- `WithHistory` deep-copies its input and `History()`/`GetTools()` return copies, so the caller
-  never shares mutable state with the agent;
-- tools execute inside the run goroutine — concurrency inside a tool is the tool's business.
-
----
-
-## 10. Logging and observability
-
-```go
-xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug/info/warn/error/off
-```
-
-- `info` by default; `logMessageSizes` (per-request size and token estimate) is `debug`;
-- every line carries `chat_id=` (read from `ctxkey.ChatID`);
-- model output, tool arguments and tool results are clipped to `logContentMaxRunes`.
+| Symptom | Cause and fix |
+| --- | --- |
+| `unknown field ExtraBody` / `ReasoningContent` at build time | The `replace` directive is missing — add it to your `go.mod` (see Installation). |
+| `run_error: llm call failed after 3 attempts (model=…)` | Wrong token, wrong base URL, or the gateway is down. The wrapped cause is in the message. |
+| `run_error: agent replied without calling a tool 5 times in a row` | The model keeps answering in prose. State explicitly that only `finish` ends the task, or make `finish` easier to call (fewer/simpler arguments). |
+| `run_error: agent execution exceeded max iterations (66)` | The task needs more turns than allowed, or a tool keeps failing. Raise `SetMaxIterations` or fix the tool. |
+| HTTP 400 when continuing a conversation | Stored history has an assistant `tool_calls` entry without matching tool results. Persist `tool_call_id` verbatim for every tool message. |
+| The run never finishes | No end tool is registered, or its name does not match what the model calls. Check `agent.EndToolNames()`. |
+| The model's own final text is missing from the answer | Only the end tool's `ModelContent` becomes the answer. Make `finish` return the text you want to show; the runtime falls back to the last assistant text only when it is empty. |
+| A tool result looks truncated | It exceeded `WithToolResultMaxBytes`: the payload is replaced by a clipped one with `"truncated": true`. Raise the cap or shrink the tool output. |
+| Concurrency errors under load | One agent instance = one run. Build a new instance per request (recipe 14). |
+| Answers come back in the wrong language | Set `WithLang("zh-CN")`, or have a tool report `Meta[user_query_language]` (recipe 4). |
 
 ---
 
-## 11. Tests
+## Development
 
 ```bash
-go test ./...
-go test -race ./...
-
-# or via the Makefile
-make check
+make fmt-check   # gofmt -l
+make vet
+make test
+make test-race
+make check       # fmt-check + vet + test
 ```
 
-20 tests. The core of the suite is a local `httptest` fake LLM (SSE streaming, recording every
-request), which allows asserting `tool_choice`, message contents, headers and call counts. They
-cover the constructor contract, the end-tool contract, text-only retries and escalation, a
-failed end tool not finishing the run, skipped-call placeholders, the stopped terminal event,
-panic recovery, LLM retries, tool-result truncation, history copying, custom headers, concurrent
-rejection and the tool-reported language.
+The suite (20 tests) runs against a local `httptest` fake LLM that streams SSE and records every
+request, so it can assert `tool_choice`, message contents, headers and call counts. CI runs the
+same checks on `main` and on pull requests.
 
 ---
 
-## 12. Known limitations
+## Known limitations
 
-1. **`skill.go` is not wired up**: nothing uses `Skill`/`BaseSkill`; `AllowedTools` is not
-   enforced and `Instruction`/`Model`/`MaxIterations` never reach a run. Either wire it into
-   `BaseAgent` (restrict the tool whitelist, apply instructions/model) or delete it.
-2. **Fork dependency**: see section 3 — every consumer must repeat the `replace` line.
-3. **Unbounded context**: the runtime does not trim the transcript (tool results are capped,
-   history is not).
-4. **Product conventions inside the SDK**: the chart/dashboard helpers in `attachment.go` belong
-   to the product layer; generic consumers can ignore or replace them.
+1. `skill.go` is not wired up: nothing uses `Skill`/`BaseSkill`, `AllowedTools` is not enforced,
+   and `Instruction`/`Model`/`MaxIterations` never reach a run. Wire it in or delete it.
+2. The fork dependency (see Installation) must be repeated by every consumer.
+3. The runtime does not trim the transcript — long conversations need your own strategy
+   (recipe 12).
+4. `attachment.go` holds product-specific chart/dashboard conventions; ignore it if your product
+   does not use them.
 
----
-
-## 13. Relationship to `orchestratorv2/agent/base`
+## Relationship to the backend copy
 
 This SDK shares its origin with `golang-backend/agents/orchestratorv2/agent/base`. The backend
 copy keeps platform dependencies (`llm.Client()` reading environment variables, `locales`,
-`utils`), while this SDK parameterizes the token/base URL, memory block, logging and HTTP client
-so it can be reused standalone. Both follow the same end-tool semantics (required in the
-constructor, text-only never finishes, success finishes, failure continues); keep them in sync
-when changing either.
+`utils`); this one parameterizes token / base URL, memory block, logging and HTTP client. Both
+follow the same end-tool semantics — keep them in sync when changing either.
