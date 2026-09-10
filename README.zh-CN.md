@@ -153,6 +153,13 @@ func main() {
 3. `finish` 成功 → channel 关闭，最终答案在 `Result().Answer` 里（就是 end tool 返回的内容）；
 4. 如果模型只回了一段话、没调工具，运行时会把它退回并附上纠正提示。
 
+更多可运行示例放在 [`examples/`](examples)：`quickstart`、`tools`、`multiturn`、
+`streaming`、`httpapi`，以及完全不需要密钥和网络的 `localmock`：
+
+```bash
+go run ./examples/localmock
+```
+
 ---
 
 ## 使用案例

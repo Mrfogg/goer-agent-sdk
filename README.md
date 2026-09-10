@@ -159,6 +159,14 @@ What happens at runtime:
    your end tool returned;
 4. if the model answers with prose only, the runtime sends it back with a corrective message.
 
+More runnable programs live in [`examples/`](examples): `quickstart`, `tools`,
+`multiturn`, `streaming`, `httpapi`, and `localmock` — the last one needs no
+credentials or network at all:
+
+```bash
+go run ./examples/localmock
+```
+
 ---
 
 ## Usage recipes
