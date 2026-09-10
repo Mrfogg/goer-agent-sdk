@@ -1,0 +1,24 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+*.prof
+
+# Go workspace files (local only)
+go.work
+go.work.sum
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local environment
+.env
+.env.*
+!.env.example
