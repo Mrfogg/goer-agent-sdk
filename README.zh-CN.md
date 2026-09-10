@@ -193,7 +193,7 @@ return base.ToolResult{
 }, nil
 ```
 
-### 4. 工具里发前端事件、回传用户语言
+### 4. 工具里给前端发事件
 
 工具可以往产品侧推事件，而不会污染模型上下文：
 
@@ -213,11 +213,11 @@ func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolR
 	return base.ToolResult{
 		Success:      true,
 		ModelContent: "图表已生成",
-		// 运行时会切换本轮及后续轮次的回答语言。
-		Meta: map[string]any{base.ToolMetaUserQueryLanguageKey: "zh-CN"},
 	}, nil
 }
 ```
+
+前端需要的额外信息（chart id、附件负载、进度百分比等）放在 `Msg.Data` 里，它不会进模型上下文。
 
 ### 5. 自定义 JSON Schema，以及读取 transcript
 
@@ -450,7 +450,7 @@ type Tool interface {
 type ToolResult struct {
 	Success      bool            // end tool 成功才结束 run
 	Error        string          // 失败原因（会进模型上下文）
-	Meta         map[string]any  // 运行时元信息，如 user_query_language
+	Meta         map[string]any  // 你自己的元信息，运行时不做解释
 	ModelContent string          // 进模型上下文的内容
 	ModelData    map[string]any  // 进模型上下文的结构化数据
 	Events       []Msg           // 只发给前端的事件
@@ -504,7 +504,7 @@ xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / inf
 | 模型自己写的最终文本没出现在答案里 | 答案只取 end tool 的 `ModelContent`。让 `finish` 返回你想展示的文本；只有它为空时才会回退到模型最后的文本。 |
 | 工具结果像是被截断了 | 超过了 `WithToolResultMaxBytes`，负载被替换成带 `"truncated": true` 的裁剪版。调大上限或让工具少返回一些。 |
 | 压测时出现并发报错 | 一个实例一次只跑一个 run。每个请求新建实例（案例 14）。 |
-| 回答语言不对 | 用 `WithLang("zh-CN")`，或让工具回传 `Meta[user_query_language]`（案例 4）。 |
+| 回答语言不对 | 用 `WithLang("zh-CN")`，语言只由这个选项控制。 |
 
 ---
 

@@ -21,7 +21,11 @@ type OpenAIFunctionProvider interface {
 type ToolResult struct {
 	Success bool
 	Error   string
-	Meta    map[string]any
+
+	// Meta carries free-form metadata for the caller's own bookkeeping. The
+	// runtime does not interpret it; it is serialized into the tool result
+	// payload the model sees.
+	Meta map[string]any
 
 	// ModelContent/ModelData are the tool result that should enter the LLM context.
 	ModelContent string
@@ -55,10 +59,6 @@ const (
 	MsgTypeRunDone        = "run_done"
 	MsgTypeRunError       = "run_error"
 	MsgTypeRunStopped     = "run_stopped"
-
-	// ToolMetaUserQueryLanguageKey is the ToolResult.Meta key under which a
-	// tool reports the user-query language so the agent can persist it.
-	ToolMetaUserQueryLanguageKey = "user_query_language"
 )
 
 func OpenAIToolDefinition(tool Tool) openai.Tool {

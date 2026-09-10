@@ -199,7 +199,7 @@ return base.ToolResult{
 }, nil
 ```
 
-### 4. Emit product events and report the user's language
+### 4. Emit product events to your frontend
 
 Tools push events to your frontend without polluting the model context:
 
@@ -219,11 +219,12 @@ func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolR
 	return base.ToolResult{
 		Success:      true,
 		ModelContent: "chart generated",
-		// The runtime switches the answer language for this and later turns.
-		Meta: map[string]any{base.ToolMetaUserQueryLanguageKey: "zh-CN"},
 	}, nil
 }
 ```
+
+Use `Data` on the emitted `Msg` for anything the frontend needs (chart id, attachment payload,
+progress percentage); it never reaches the model.
 
 ### 5. Custom JSON schema, and reading the transcript
 
@@ -461,7 +462,7 @@ type Tool interface {
 type ToolResult struct {
 	Success      bool            // end tool success finishes the run
 	Error        string          // failure reason shown to the model
-	Meta         map[string]any  // runtime metadata, e.g. user_query_language
+	Meta         map[string]any  // your own metadata; the runtime does not interpret it
 	ModelContent string          // enters the model context
 	ModelData    map[string]any  // enters the model context (structured)
 	Events       []Msg           // sent to your frontend only
@@ -515,7 +516,7 @@ carries `chat_id=`, and model output, tool arguments and results are clipped.
 | The model's own final text is missing from the answer | Only the end tool's `ModelContent` becomes the answer. Make `finish` return the text you want to show; the runtime falls back to the last assistant text only when it is empty. |
 | A tool result looks truncated | It exceeded `WithToolResultMaxBytes`: the payload is replaced by a clipped one with `"truncated": true`. Raise the cap or shrink the tool output. |
 | Concurrency errors under load | One agent instance = one run. Build a new instance per request (recipe 14). |
-| Answers come back in the wrong language | Set `WithLang("zh-CN")`, or have a tool report `Meta[user_query_language]` (recipe 4). |
+| Answers come back in the wrong language | Set `WithLang("zh-CN")` — the language is only controlled by this option. |
 
 ---
 

@@ -133,11 +133,3 @@ func cloneMessage(msg openai.ChatCompletionMessage) openai.ChatCompletionMessage
 	}
 	return cloned
 }
-
-func toolResultUserQueryLanguage(result ToolResult) string {
-	raw, ok := result.Meta[ToolMetaUserQueryLanguageKey].(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(raw)
-}

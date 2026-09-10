@@ -276,28 +276,3 @@ func TestToolResultTruncationKeepsRunWorking(t *testing.T) {
 		t.Fatalf("tool result was not marked as truncated: %q", result.Content)
 	}
 }
-
-func TestToolLanguageMetadataUpdatesAgentLanguage(t *testing.T) {
-	langTool := &stubTool{
-		name: "finish",
-		execute: func(ctx context.Context, args map[string]any) (ToolResult, error) {
-			return ToolResult{
-				Success:      true,
-				ModelContent: "最终答案",
-				Meta:         map[string]any{ToolMetaUserQueryLanguageKey: "zh-CN"},
-			}, nil
-		},
-	}
-	llm := newFakeLLM(sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}))
-	server := llm.start(t)
-	agent := startAgent(t, server, langTool)
-
-	msgs := collectRun(t, agent, "hi")
-
-	if done, ok := lastMessageOfType(msgs, MsgTypeRunDone); !ok || done.Content != "最终答案" {
-		t.Fatalf("expected the localized answer, got %v", msgTypes(msgs))
-	}
-	if agent.Lang() != "zh-CN" {
-		t.Fatalf("agent language = %q, want zh-CN", agent.Lang())
-	}
-}

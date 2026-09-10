@@ -82,7 +82,6 @@ func (a *BaseAgent) handleOpenAIToolCall(ctx context.Context, toolCall openai.To
 	agentLogInfo(ctx, "tool call finished: tool=%q tool_call_id=%s arguments_bytes=%d result_bytes=%d result_content_bytes=%d success=%v exec_err=%v",
 		toolName, strings.TrimSpace(toolCall.ID), len(toolCall.Function.Arguments), len(historyContent), len(result.ModelContent), result.Success, execErr != nil)
 	logToolCallFailure(ctx, toolCall, toolName, result, execErr)
-	a.applyToolMetadata(ctx, toolName, result)
 
 	for _, event := range result.Events {
 		emit(event)
@@ -94,19 +93,6 @@ func (a *BaseAgent) handleOpenAIToolCall(ctx context.Context, toolCall openai.To
 		Content:    historyContent,
 	})
 	return a.toolCallEndsRun(toolName, result, execErr)
-}
-
-// applyToolMetadata lets a tool report run-level settings, currently the language
-// the user wrote in. The setting is applied to this run and kept for the next one.
-func (a *BaseAgent) applyToolMetadata(ctx context.Context, toolName string, result ToolResult) {
-	lang := toolResultUserQueryLanguage(result)
-	if lang == "" {
-		return
-	}
-	a.runMu.Lock()
-	a.lang = lang
-	a.runMu.Unlock()
-	agentLogInfo(ctx, "tool %q returned user_query_language=%q, agent lang updated", toolName, lang)
 }
 
 func (a *BaseAgent) toolCallEndsRun(toolName string, result ToolResult, execErr error) (ended bool, answer string) {
