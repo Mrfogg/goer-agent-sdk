@@ -2,44 +2,120 @@
 
 [English](README.md) · **简体中文**
 
-把任意 OpenAI 兼容的对话模型变成一个**会用工具的 agent**，而「任务完成」这件事只由你写的工具说了算。
+把任意 OpenAI 兼容模型变成一个**只用工具报告完成**的 agent。
 
-你注册工具，模型在循环里调用它们，只要某个 **end tool** 成功返回，这一轮就结束。纯文本回答永远不会结束
-run——所以「做完了没有」由你的代码判断，而不是由模型的措辞判断。
+你注册工具，模型在循环里调用它们；只有当某个 **end tool** 成功返回时，这一轮才结束。纯文本回答
+永远结束不了任务——「做完了没有」由你的代码判定，不由模型的措辞判定。
 
 ```go
 agent := base.NewBaseAgent(
-	"report-agent", "生成报表", systemPrompt,
+	"report-agent", "Generates reports", systemPrompt,
 	"gpt-4o", os.Getenv("LLM_TOKEN"), os.Getenv("LLM_BASE_URL"),
 	finishTool{}, // end tool：这一轮唯一的结束方式
 )
 agent.AddTool(aggregateTool{}) // 过程中可以调的普通工具
 
-stream, err := agent.Run(ctx, "帮我总结这张表")
-if err != nil {
-	panic(err)
-}
+stream, _ := agent.Run(ctx, "统计这张表并给出结论")
 for msg := range stream {
-	fmt.Print(msg.Content) // "reasoning" 是思考，"content" 是正文
+	forward(msg) // reasoning = 思考过程，content = 回答正文
 }
-fmt.Println("\nanswer:", agent.Result().Answer)
+fmt.Println("answer:", agent.Result().Answer)
 ```
+
+---
+
+## 设计思路
+
+### 一、一次任务 = 一个有终点的工具循环
+
+```
+用户输入
+  ↓
+构建请求 = system prompt + transcript
+  ↓
+调模型 ─┬─ 要调工具 ─→ 执行工具 ─→ 结果写回 transcript ─┐
+        └─ 只回文本 ─→ 退回并附纠正提示 ───────────────┤
+                                                       ↓
+                        回到「调模型」（默认最多 66 轮）◀┘
+                                                       ↓
+                          end tool 成功 ─→ 结束，交付 ModelContent
+```
+
+由此推出三条硬规则：
+
+1. 只有成功的 end tool 能结束一轮 run；纯文本回答会被退回，要求调用工具。
+2. end tool 失败（`Success=false` 或返回 error）**不**结束，模型看到失败原因后继续。
+3. 交付给用户的答案是 end tool 的 `ModelContent`，而不是模型最后那段话。
+
+### 二、两种工具
+
+| | 普通工具 | end tool |
+| --- | --- | --- |
+| 怎么注册 | `AddTool(t)` | 构造函数、`WithEndTool`、`WithEndTools` |
+| 干什么 | 干活：取数、计算、画图、读写记忆 | 交付：提交最终答案 |
+| 成功返回 | 循环继续 | **结束本轮**，`ModelContent` 即最终答案 |
+| 失败返回 | 循环继续，模型看到错误 | 循环继续，不结束 |
+
+两者实现的是同一个 `Tool` 接口（`Name` / `Description` / `Execute`），差别只在注册时的身份。
+
+**为什么这么设计：**
+
+- **完成必须能被程序断言。** 让模型「说完成了」就算完成，你无法校验——它可能在差一步时宣布结束，
+  也可能把「我准备这么做」写成完成。把终点收成一个工具调用后，完成变成一个确定的事件：函数被调用、
+  参数能解析、你的校验能通过。
+- **两种工具是两种职责。** 普通工具的输出是「给模型看的事实」，end tool 的输出是「给用户看的交付物」。
+  如果只有一个工具，模型很容易查了个行数就顺手交付。
+- **校验放在 end tool 里最自然。** 它是唯一出口，天然是所有交付约束的检查点（必须是 markdown 表格、
+  长度上限、必填字段……）。校验不过就返回 `Success=false`，模型带着原因重来。
+- **失败原因也要进上下文。** end tool 的失败原因会写回 transcript，模型才知道为什么被打回、要改什么。
+
+### 三、什么进模型上下文，什么发给产品侧
+
+`ToolResult` 明确分成两个通道：
+
+| 字段 | 去哪 |
+| --- | --- |
+| `ModelContent` / `ModelData` | 进模型上下文 |
+| `Error` | 进模型上下文（失败原因） |
+| `Events` | 只发给产品侧，模型永远看不到 |
+| `Meta` | 不进上下文，运行时不解释，给你自己记账 |
+
+分开的理由：图表 option、附件 id、进度百分比这类东西进上下文既浪费 token 又干扰推理。工具需要推
+产品事件时，用 `ctxkey.ToolEventEmitter` 往 run 的消息流里抛（见「在工具里读 transcript 和发事件」）。
+
+### 四、状态归谁
+
+| 状态 | 谁持有 |
+| --- | --- |
+| transcript（本轮对话） | 运行时，内存里 |
+| 跨轮持久化 | 你：`History()` 取出，`WithHistory()` 灌回 |
+| 同时进行的 run | 一个实例一次只跑一个 |
+| 上下文压缩 | 运行时，按上下文窗口自己判断 |
+
+一个实例 = 一次 run，所以运行时内部不需要为并发请求做任何协调；跨轮状态由你显式传入，存成什么形态
+（DB、Redis、文件）完全由你决定，运行时不碰你的存储。
+
+### 五、上下文压缩
+
+长任务会把上下文窗口撑满。运行时不把这件事推给调用方：窗口的 60% 触发压缩，压缩后逐字保留尾部
+预算的 25%，被压段替换成一条 `<compacted-history>` 消息（结构化摘要 + 逐字 user 消息清单）。触发、
+边界选择、失败语义见[上下文压缩](#上下文压缩)。
 
 ---
 
 ## 安装
 
-```bash
+```
 go get github.com/Mrfogg/goer-agent-sdk
 ```
 
-### 必读：必须加 `replace`
+### 必须加的 `replace` 指令
 
-SDK 用到两处上游 `go-openai` 还没有的能力：请求体顶层的 `ExtraBody`（reasoning 模型的
-`thinking` / `reasoning` 字段），以及解析回复时的 OpenAI 风格 `reasoning` 字段。这两处只在 fork 里，
-而那个 fork 的 `go.mod` 声明的仍是上游模块路径，所以只能用 `replace` 选中它。
+SDK 需要上游 `go-openai` 还没有的两样东西：请求体的顶层 `ExtraBody`（reasoning 模型用的 `thinking` /
+`reasoning` 字段），以及解析回复时的 `reasoning` 字段。两者都在一个 fork 里，而这个 fork 仍然声明
+上游模块路径，所以只能用 `replace` 选中它。
 
-**每个 import 本 SDK 的模块**都要在自己的 `go.mod` 里加这两行：
+在**每个 import 了本 SDK 的模块**的 `go.mod` 里加上：
 
 ```
 require github.com/sashabaranov/go-openai v1.42.0
@@ -47,19 +123,14 @@ require github.com/sashabaranov/go-openai v1.42.0
 replace github.com/sashabaranov/go-openai => github.com/neugls/go-openai v1.42.0-reasoning-extra-body
 ```
 
-实际影响：
-
-- **不加就编译不过**（不是运行时问题）：编译器会报 `llm.go` 里 `ExtraBody` / `ReasoningContent`
-  字段不存在。
-- **Go 不继承依赖的 `replace`**：写在 SDK 仓库自己的 `go.mod` 里对使用方没用，必须各自复制上面两行。
-- **SDK 不在同一仓库时**，再加一行
+- 漏了不是运行时报错，是**编译**报 unknown field `ExtraBody` / `ReasoningContent`。
+- Go 会忽略依赖自己的 `replace`：写在本仓库的 `go.mod` 里对使用方无效，每个使用方都要抄一遍。
+- SDK 与你的代码在同一台机器上时，再加一行
   `replace github.com/Mrfogg/goer-agent-sdk => ../goer-agent-sdk`。
-- **fork 必须能拉到**（公开或已鉴权），否则你的 CI 在干净机器上 `go mod download` 会失败。
+- fork 必须对 CI 也可达（公开或已认证），`go mod download` 会在干净机器上拉它。
 
-如果你的网关完全不需要 reasoning 字段，可以不调用 `WithReasoningEffort(...)`，直接依赖上游
-`go-openai`；但本仓库发布的源码默认按 fork 构建。
-
-环境要求：Go 1.23+。
+如果你的上游完全不需要 reasoning 字段，也可以不调用 `WithReasoningEffort`，自己依赖上游
+`go-openai`——但仓库里的源码是按 fork 编译的。要求 Go 1.23+。
 
 ---
 
@@ -79,27 +150,27 @@ import (
 	base "github.com/Mrfogg/goer-agent-sdk"
 )
 
-// 1. 普通工具：模型干活过程中可以调它。
+// 普通工具：模型干活过程中可以调它。
 type rowsTool struct{}
 
 func (rowsTool) Name() string        { return "count_rows" }
-func (rowsTool) Description() string { return "统计当前表格的行数" }
+func (rowsTool) Description() string { return "Count the rows of the current sheet" }
 
 func (rowsTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
-	// ModelContent 是下一轮模型能看到的内容。
-	return base.ToolResult{Success: true, ModelContent: "共 120 行"}, nil
+	// ModelContent 是模型下一轮会看到的内容。
+	return base.ToolResult{Success: true, ModelContent: "120 rows"}, nil
 }
 
-// 2. end tool：它成功返回，这一轮才结束。
+// end tool：它成功返回，这一轮才结束。
 type finishTool struct{}
 
 func (finishTool) Name() string        { return "finish" }
-func (finishTool) Description() string { return "任务完成时提交最终答案" }
+func (finishTool) Description() string { return "Submit the final answer when the task is complete" }
 
 func (finishTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	answer, _ := args["answer"].(string)
 	if strings.TrimSpace(answer) == "" {
-		// 返回失败 → run 继续：模型看到这个错误后会重做。
+		// 失败不会结束 run：模型会看到这条错误并重试。
 		return base.ToolResult{Success: false, Error: "answer is required"}, nil
 	}
 	return base.ToolResult{Success: true, ModelContent: answer}, nil
@@ -108,10 +179,10 @@ func (finishTool) Execute(ctx context.Context, args map[string]any) (base.ToolRe
 func main() {
 	agent := base.NewBaseAgent(
 		"report-agent",
-		"总结表格的 agent",
+		"Agent that summarises spreadsheets",
 		"You are a data analyst. Use the tools, then call finish with the final answer.",
 		"gpt-4o",
-		os.Getenv("LLM_TOKEN"),    // auth token
+		os.Getenv("LLM_TOKEN"),    // 认证 token
 		os.Getenv("LLM_BASE_URL"), // base URL，例如 https://api.openai.com/v1
 		finishTool{},
 	)
@@ -120,7 +191,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stream, err := agent.Run(ctx, "这张表有多少行？")
+	stream, err := agent.Run(ctx, "How many rows does this sheet have?")
 	if err != nil {
 		panic(err)
 	}
@@ -128,7 +199,7 @@ func main() {
 	for msg := range stream {
 		switch msg.Type {
 		case base.MsgTypeReasoning:
-			fmt.Print(msg.Content) // 模型的思考内容，流式
+			fmt.Print(msg.Content) // 模型的思考，流式
 		case base.MsgTypeContent:
 			fmt.Print(msg.Content) // 回答正文，流式
 		case base.MsgTypeUsage:
@@ -137,8 +208,6 @@ func main() {
 	}
 
 	result := agent.Result()
-	fmt.Printf("tokens: input=%d output=%d over %d LLM calls\n",
-		result.Usage.PromptTokens, result.Usage.CompletionTokens, result.LLMCalls)
 	switch {
 	case result.Err != nil:
 		fmt.Println("\nfailed:", result.Err)
@@ -150,16 +219,16 @@ func main() {
 }
 ```
 
-运行时会依次发生：
+这一轮里发生了什么：
 
-1. 模型返回工具调用（`count_rows` 或 `finish`）；
+1. 模型回一个工具调用（`count_rows` 或 `finish`）；
 2. 普通工具的结果写回 transcript，循环继续；
-3. `finish` 成功 → 它的内容作为最后一条 `content` 消息发出，随后 channel 关闭
-   （`Result().Answer` 是同一份内容）；
-4. 如果模型只回了一段话、没调工具，运行时会把它退回并附上纠正提示。
+3. `finish` 成功后 run 结束，它的内容作为最后一条 `content` 消息发出，channel 关闭，
+   `Result().Answer` 是同一份文本；
+4. 模型只回文本时，运行时会退回并附上纠正提示。
 
-更多可运行示例放在 [`examples/`](examples)：`quickstart`、`tools`、`multiturn`、
-`streaming`、`httpapi`，以及完全不需要密钥和网络的 `localmock`：
+更多可运行程序在 [`examples/`](examples)：`quickstart`、`tools`、`multiturn`、`streaming`、
+`httpapi`、`localmock`——最后一个不需要任何凭据或网络：
 
 ```bash
 go run ./examples/localmock
@@ -167,328 +236,212 @@ go run ./examples/localmock
 
 ---
 
-## 使用案例
+## 使用
 
-### 1. 多个工具 + 一次交付
-
-最常见的形态：普通工具干活，end tool 交付。
+### 定义普通工具
 
 ```go
-agent := base.NewBaseAgent("analyst", "数据分析", prompt, model, token, baseURL, finishTool{})
-agent.AddTool(queryTool{})     // 取数
-agent.AddTool(aggregateTool{}) // 计算
-agent.AddTool(chartTool{})     // 画图
+type rowsTool struct{}
+
+func (rowsTool) Name() string        { return "count_rows" }
+func (rowsTool) Description() string { return "Count the rows of the current sheet" }
+
+func (rowsTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
+	return base.ToolResult{
+		Success:      true,
+		ModelContent: "120 rows",                             // 给模型看
+		ModelData:    map[string]any{"rows": 120, "cols": 3}, // 结构化，同样进上下文
+	}, nil
+}
+
+agent.AddTool(rowsTool{})
 ```
 
-在 system prompt 里把交付方式说清楚（「先用其他工具干活，最后调用 `finish`」）。运行时每次请求还会
-自动追加 end-tool 规则：
-
-> END-TOOL MODE (MANDATORY) — End tools: [finish]. Only a successful call to one of these tools
-> can finish this run; a text-only answer never ends the run and will be sent back to you.
-
-### 2. 在 end tool 里做校验
-
-end tool 是唯一的关卡，所以质量校验放在这里。返回失败就是「不合格，继续改」。
+### 定义 end tool
 
 ```go
+type finishTool struct{}
+
+func (finishTool) Name() string        { return "finish" }
+func (finishTool) Description() string { return "Submit the final answer when the task is complete" }
+
 func (finishTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	answer, _ := args["answer"].(string)
-	if !strings.Contains(answer, "|") {
-		// 模型下一轮会看到这条错误，并据此修正。
-		return base.ToolResult{Success: false, Error: "answer 必须包含 markdown 表格"}, nil
+	if !strings.Contains(answer, "|") { // 交付约束就写在这里
+		return base.ToolResult{Success: false, Error: "answer must contain a markdown table"}, nil
 	}
 	if len(answer) > 8000 {
-		return base.ToolResult{Success: false, Error: "answer 太长，请精简"}, nil
+		return base.ToolResult{Success: false, Error: "answer is too long, summarise it"}, nil
 	}
 	return base.ToolResult{Success: true, ModelContent: answer}, nil
 }
+
+// 构造函数至少要有一个 end tool，否则 panic。
+agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, token, baseURL, finishTool{})
 ```
 
-### 3. 给模型返回结构化结果
+end tool 成功但 `ModelContent` 为空时，运行时会退而使用模型最后那段文本；两者都为空则加一条纠正
+消息让模型重来。
 
-`ModelContent` 是文本，`ModelData` 是结构化数据，两者都会进模型上下文。
+### 自定义工具参数 schema
 
-```go
-return base.ToolResult{
-	Success:      true,
-	ModelContent: "查询完成：120 行、3 列",
-	ModelData: map[string]any{
-		"rows":    120,
-		"columns": []string{"date", "region", "amount"},
-	},
-}, nil
-```
-
-### 4. 工具里给前端发事件
-
-工具可以往产品侧推事件，而不会污染模型上下文：
-
-```go
-import "github.com/Mrfogg/goer-agent-sdk/ctxkey"
-
-func (t chartTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
-	option := buildChartOption(args) // 你自己的逻辑
-
-	if emit, ok := ctx.Value(ctxkey.ToolEventEmitter).(base.ToolEventEmitter); ok {
-		emit(base.Msg{
-			Type: base.MsgTypeChartResult,
-			Data: map[string]any{"chart_id": "sales", "chart_option": option},
-		})
-	}
-
-	return base.ToolResult{
-		Success:      true,
-		ModelContent: "图表已生成",
-	}, nil
-}
-```
-
-前端需要的额外信息（chart id、附件负载、进度百分比等）放在 `Msg.Data` 里，它不会进模型上下文。
-
-### 5. 自定义 JSON Schema，以及读取 transcript
-
-默认参数 schema 是「任意 JSON 对象」。需要严格 schema 就实现 `OpenAIFunctionProvider`：
+默认参数 schema 是「任意 JSON 对象」。实现 `OpenAIFunctionProvider` 可以给出严格 schema：
 
 ```go
 func (finishTool) OpenAIFunctionDefinition() *openai.FunctionDefinition {
 	return &openai.FunctionDefinition{
 		Name:        "finish",
-		Description: "提交最终答案",
+		Description: "Submit the final answer",
 		Parameters: base.OpenAIObjectSchema(map[string]jsonschema.Definition{
-			"answer": base.OpenAIStringSchema("markdown 格式的最终答案"),
+			"answer": base.OpenAIStringSchema("Final answer in markdown"),
 		}, "answer"),
 	}
 }
 ```
 
-工具还能读到「自己开始执行时」的 transcript 副本：
+可用的构造器：`OpenAIObjectSchema`、`OpenAIArraySchema`、`OpenAIStringSchema`、`OpenAIIntegerSchema`、
+`OpenAIBooleanSchema`。
+
+### 在工具里读 transcript 和发事件
+
+工具执行时，context 里带着 run 的状态：
 
 ```go
+// 工具开始执行时的 transcript 副本。
 history, _ := ctx.Value(ctxkey.AgentHistory).([]openai.ChatCompletionMessage)
-```
 
-### 6. 多轮对话
-
-一轮一个 agent 实例；持久化由你负责。
-
-```go
-agent := base.NewBaseAgent("analyst", "数据分析", prompt, model, token, baseURL, finishTool{}).
-	WithHistory(loadHistory(chatID)) // 从你的存储里读 []openai.ChatCompletionMessage
-
-for msg := range agent.Run(ctx, userInput) {
-	forward(msg)
+// 往 run 的消息流里推一条产品事件：不进模型上下文。
+if emit, ok := ctx.Value(ctxkey.ToolEventEmitter).(base.ToolEventEmitter); ok {
+	emit(base.Msg{
+		Type: "chart_result", // 类型由你自己定义，运行时只负责转发
+		Data: map[string]any{"chart_id": "sales", "chart_option": option},
+	})
 }
-
-saveHistory(chatID, agent.History()) // 返回副本，可以放心留存
 ```
 
-入库时要原样保留 `role`、`content`、`tool_calls`、`tool_call_id`——原因见「排错」里的 HTTP 400。
+`ctxkey` 里共三个键：`ChatID`（会话 id，日志用）、`AgentHistory`（transcript 副本）、
+`ToolEventEmitter`（发事件的函数）。
 
-### 7. 流式转发前端 + 停止按钮
+### 发起 run、读结果
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
-stream, err := agent.Run(ctx, userInput)
+defer cancel()
+
+stream, err := agent.Run(ctx, userInput) // err 表示调用方式有问题，例如实例已在跑
 if err != nil {
 	return err
 }
-
-go func() {
-	for msg := range stream {
-		forward(msg) // "reasoning" 或 "content"，你的 websocket / SSE 写出
-	}
-	closeClientStream()
-}()
-
-// ... 用户点了「停止」
-cancel() // 或者 agent.Stop()
+for msg := range stream {
+	forward(msg)
+}
+result := agent.Result()
 ```
 
-| 消息类型 | 含义 |
+run 期间只有三种消息：
+
+| `msg.Type` | 含义 |
 | --- | --- |
-| `reasoning` | 模型的思考（推理）内容，流式吐出 |
-| `content` | 回答正文，流式吐出 |
-| `usage` | 单次 LLM 调用的 token 用量，放在 `Data` 里 |
+| `reasoning` | 模型的思考文本，流式累积 |
+| `content` | 回答正文，最后一条一定是 end tool 的答案 |
+| `usage` | 单次 LLM 调用的 token 用量，在 `msg.Data` 里 |
 
-运行时只会发这三种消息：没有心跳、没有开始标记、也没有终态事件——channel 关闭即 run 结束，
-之后用 `Result()` 拿结果。其中最后一条 `content` 一定是 end tool 给出的最终答案；
-每次 LLM 调用只要返回了用量，就会多一条 `usage` 消息。
+没有心跳、没有开始/结束标记——channel 关闭就是 run 结束。结局只在 `Result()` 里：成功看 `Answer`、
+取消看 `Stopped`、失败看 `Err`，token 用量累加在 `Usage` / `LLMCalls`。
 
-### 8. 超时与取消
+### 多轮对话
 
-给 run 一个 deadline；超时后 `Result().Stopped` 为 true，`Result().Err` 是
-`context.DeadlineExceeded`。
+运行时不替你持久化，跨轮状态显式传递：一轮一个实例，历史自己存。
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-defer cancel()
+agent := base.NewBaseAgent("analyst", "Data analyst", prompt, model, token, baseURL, finishTool{}).
+	WithHistory(loadHistory(chatID)) // 从你自己的存储里读出来
+
+for msg := range stream {
+	forward(msg)
+}
+
+saveHistory(chatID, agent.History()) // 返回深拷贝，可以放心留存
 ```
 
-长回答场景**不要**用 `http.Client.Timeout`——它会把整个响应体一起算进超时。优先用 context
-deadline，`WithHTTPClient` 只用来配代理/transport。
+`History()` 与 `WithHistory()` 都是深拷贝，两边不会共享可变状态；`HasState()` 判断是否已有历史。
+落库时 `role`、`content`、`tool_calls`、`tool_call_id` 要原样保存，否则下一轮请求会被上游拒绝（见
+「排错」）。可序列化的形态是 `base.AgentContextSnapshot`。
 
-### 9. 接第三方网关
+上面两个函数 `loadHistory` / `saveHistory` 代表你自己的存储实现：SDK 没有持久化层，它只负责把
+transcript 交给你、再接收回来。
 
-```go
-agent := base.NewBaseAgent("analyst", "数据分析", prompt, model, apiKey, "https://my-gateway/v1", finishTool{}).
-	WithHTTPHeaders(map[string]string{
-		"X-OpenRouter-Title": "excelmatic",
-		"HTTP-Referer":       "https://excelmatic.com",
-	}).
-	WithHTTPClient(&http.Client{Transport: myProxyTransport})
-```
+### 记忆模块与计划模块
 
-`baseURL` 会原样交给客户端；传空字符串则用库的默认端点。
-
-### 10. reasoning 模型
-
-```go
-agent.WithReasoningEffort("medium") // 发送 reasoning_effort 与 thinking/reasoning 请求体字段
-```
-
-推理内容会以 `reasoning` 事件单独吐出，与回答正文的 `content` 事件分开。传空串即关闭 reasoning 请求参数。
-
-### 11. 记忆模块与计划模块
+两个可选模块，注册后自动带上工具和提示词段落：
 
 ```go
 type myMemory struct{}
 
 func (myMemory) Tools() []base.Tool { return []base.Tool{rememberTool{}, recallTool{}} }
-
 func (myMemory) BuildPromptBlock(ctx context.Context) string {
-	return "已知用户信息：\n- 从事金融行业" // 会被追加到 system prompt
+	return "记忆使用说明…"
 }
 
-agent.WithMemory(myMemory{})
+agent.WithMemory(myMemory{}) // 注册它的工具 + 追加提示词段落
+```
+
+计划模块多两个钩子：`Reset()` 每轮 run 开始时调用，`ValidateFinalAnswer(ctx)` 在答案发出前校验
+（校验失败会自动完成剩余任务并发出一条事件）。
+
+```go
 agent.WithPlanModule(myPlan{}) // Tool() + Prompt() + Reset() + ValidateFinalAnswer()
 ```
 
-注册计划模块后：它的工具会被注册、提示词段落会被追加、每次 run 开始调用 `Reset()`、答案发出前调用
-`ValidateFinalAnswer(ctx)`（校验失败会自动完成剩余任务并发出一条事件）。
+### 上下文压缩
 
-### 12. 控制上下文体积
-
-```go
-agent.WithMaxContextTokens(128 * 1024)   // 模型上下文窗口：自动压缩的唯一依据
-agent.WithToolResultMaxBytes(128 * 1024) // 过大的工具结果会被替换成裁剪版
-agent.SetMaxIterations(40)               // 单轮 run 的轮次上限（默认 66）
-
-// 想用自己的策略时，手动裁剪历史依然可以：
-agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
-```
-
-`WithMaxContextTokens` 打开自动上下文压缩：一旦某次调用返回的 prompt token 越过窗口的触发比例，
-运行时会先把 transcript 压缩好，再构建下一次请求。细节见[上下文压缩](#上下文压缩)。
-
-### 13. 把一次 run 入库
+`WithMaxContextTokens` 是唯一的开关——给出模型窗口，其余按比例推导（不设置则默认 1,000,000）。
 
 ```go
-stream, err := agent.Run(ctx, input)
-if err != nil {
-	return err
-}
-for msg := range stream {
-	forward(msg) // 把模型输出实时转发给用户
-}
-
-result := agent.Result()
-if result.Err != nil {
-	// 处理失败（Result().Stopped 用来区分「被取消」还是「出错」）
-}
-db.SaveTurn(chatID, result.Answer, agent.History())
+agent.WithMaxContextTokens(128 * 1024)
 ```
 
-`result.Answer` 是 end tool 给出的最终内容；`agent.History()` 是完整 transcript，供下一轮使用。
-产品侧的负载（图表、dashboard）由工具自己通过 `Msg.Data` 抛出，运行时不替你聚合。
+触发依据是最近一次调用返回的 `prompt_tokens`（事后值，用量缺失时永不触发）超过 `窗口 × 0.6`；
+压缩后逐字保留的尾部预算是 `阈值 × 0.25`。
 
-### 14. 在 HTTP handler 里使用
+裁剪点的选择顺序：优先切在 `user` 消息（轮次起点）；若最新一轮单独就超预算，就钻进该轮内部的
+`assistant` 迭代点；最后才退到 `assistant` 之间。`system` 永不进压缩区，`tool` 消息永远不能做
+裁剪点——工具结果不能脱离它应答的那次调用单独发出。
+
+被压段替换成一条 `user` 消息，内容是 `<compacted-history>` + 结构化摘要（8 个固定章节）+ 最多
+40 条 user 消息逐字清单 + 续接契约。摘要由模型生成（不带工具、`max_tokens=3000`）；逐字清单由纯
+代码抽取、完全不经过模型，所以即使摘要模型跑偏，用户原话也不会丢。摘要调用失败时本次压缩作废，
+transcript 保持原样，run 继续。
+
+压缩块就是普通历史：跟着 transcript 一起入库，用 `WithHistory` 恢复即可——恢复后它能被结构特征
+认出，下一次压缩只压它之后的增长段，并把上一次的摘要折叠进新摘要。
+
+### 超时、取消与输出模式
 
 ```go
-func handle(w http.ResponseWriter, r *http.Request) {
-	agent := base.NewBaseAgent("analyst", "数据分析", prompt, model, token, baseURL, finishTool{}).
-		WithHistory(loadHistory(chatID)) // 每请求一个实例：没有共享状态
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+defer cancel()
 
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	stream, err := agent.Run(ctx, r.FormValue("input"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
-	for msg := range stream {
-		writeEvent(w, msg)
-	}
-	saveHistory(chatID, agent.Result().Answer, agent.History())
-}
+cancel() // 或者 agent.Stop()：都会让 run 以 Result().Stopped 结束
 ```
 
-一个实例一次只跑一个 run。并发调用第二个 `Run` 会拿到一条
-`agent is already running: one BaseAgent instance handles a single run at a time` 的 error。
-
-### 15. 流式输出与非流式输出
-
-`OutputModeStreaming`（默认）在模型生成过程中就把消息发出来，前端可以边生成边渲染；
-`OutputModeNonStreaming` 等每次回复完成，再按类型各发一条完整消息——适合批量任务、便宜模型，
-或者增量对调用方没意义的场景。
+长回答不要用 `http.Client.Timeout`（它把整个响应体算进超时），优先用 context deadline。
 
 ```go
-agent.WithOutputMode(base.OutputModeStreaming)    // 默认：一次回复会来很多条消息
-agent.WithOutputMode(base.OutputModeNonStreaming) // 一次回复只来一条消息
+agent.WithOutputMode(base.OutputModeStreaming)    // 默认：生成过程中持续发消息
+agent.WithOutputMode(base.OutputModeNonStreaming) // 每次回复完成后按类型各发一条
 ```
 
-其余一切不变：两种消息类型、end-tool 契约、结果处理方式在两种模式下完全一致。离线示例可以
-直接对比：
+两种模式的消息类型、end-tool 契约和结果处理完全一致，区别只是消息到达的频率。
 
-```bash
-go run ./examples/localmock                    # 流式
-MODE=non_streaming go run ./examples/localmock # 非流式
+### 日志
+
+```go
+xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / info / warn / error / off
 ```
 
----
-
-## 运行规则
-
-1. 构造函数必须传至少一个 end tool，否则 `panic`。
-2. 只有 end tool 成功返回才能结束 run；纯文本回答会被退回给模型。
-3. end tool 返回 `Success=false` 或 error 都不结束 run。
-4. 连续 2 次纯文本回答 → 下一次请求强制 `tool_choice=required`；连续 5 次 → run 失败。
-5. 同一轮里排在 end tool 之后的工具调用会写成「已跳过」占位，保证 transcript 合法。
-6. LLM 传输失败退避重试 3 次（500ms → 1s），失败原因保留在 `Result().Err` 里。
-7. 工具 panic 会被兜进 `Result().Err`，进程不受影响，run 槽位一定释放。
-8. run 结束时 channel 关闭，结果只在 `Result()` 里：成功看 `Answer`，被取消看 `Stopped`，失败看 `Err`。
-9. end tool 的最终答案会作为最后一条 `content` 消息出现在流里，同时镜像到 `Result().Answer`。
-10. 输出模式：`OutputModeStreaming`（默认）与 `OutputModeNonStreaming` 发出的是同样两种消息，区别只是消息到达的频率。
-11. 每次 LLM 调用只要provider 返回了 token 用量，就会发一条 `usage` 消息，并累加到 `Result().Usage`，调用次数记在 `Result().LLMCalls`。流式请求通过 `stream_options.include_usage` 主动索要该字段，遇到不接受它的网关可以用 `WithStreamUsage(false)` 关掉。
-12. 上下文压缩在构建请求之前检查，依据是上一次调用返回的 `prompt_tokens`。摘要调用失败时本次压缩作废，transcript 原样保留。
-
-### 模型实际收到的消息
-
-发送前 `sanitizeMessagesForLLM` 会清空每条消息的 `Name`，并把空的 `Content` / `ReasoningContent`
-替换成一个空格（不少 provider 会拒绝空字符串）。所以内存里的 transcript 与实际发出的报文有这点差异。
-
----
-
-## 上下文压缩
-
-长对话最终会撑爆模型的上下文窗口。运行时不会就此报错，而是压缩 transcript，且**上下文窗口是唯一的
-计算依据**。
-
-- **触发**：最近一次调用返回的 `prompt_tokens`（事后值；用量缺失时永不触发）超过
-  `WithMaxContextTokens × 0.6`。默认窗口 1,000,000。
-- **预算**：压缩后逐字保留的尾部 = 触发阈值 × 0.25。
-- **裁剪点**：优先切在 `user` 消息（轮次起点）；若最新一轮单独就超预算，就钻进该轮内部的
-  `assistant` 迭代点；最后才退到 `assistant` 之间。`system` 永不进压缩区，`tool` 消息永远不能做
-  裁剪点——工具结果不能脱离它所应答的那次调用单独发出。
-- **产物**：被压段替换成一条 `user` 消息：`<compacted-history>` + 结构化摘要（8 个固定章节）+
-  最多 40 条 user 消息逐字清单 + 续接契约。摘要由模型生成（不带工具、`max_tokens=3000`）；逐字清单
-  由纯代码抽取、完全不经过模型，所以即使摘要模型跑偏，用户原话也不会丢。
-- **失败**：摘要调用失败则本次压缩作废，transcript 保持原样，run 继续。
-- **重复压缩**：压缩块会顶到 history 头部，下一次压缩跳过它，只压其后的增长段，并把上一次的摘要
-  折叠进新摘要。
-
-压缩块就是普通历史：跟着 transcript 一起入库，用 `WithHistory` 恢复即可。压缩状态本身是进程内的，
-恢复回来的压缩块靠结构特征识别。
+默认 `info`。所有日志行都带 `chat_id=`（有时），模型输出、工具参数与结果都会被截断；每轮请求的
+消息体积与 token 估算（`logMessageSizes`）是 `debug` 级。
 
 ---
 
@@ -509,7 +462,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `WithModel(model)` | 覆盖模型 |
 | `WithSystemPrompt(prompt)` | 覆盖基础 system prompt |
 | `WithLang(lang)` | 强制回答语言 |
-| `WithReasoningEffort(effort)` | 开启 reasoning 请求参数 |
+| `WithReasoningEffort(effort)` | 开启 reasoning 请求字段 |
 | `WithOutputMode(mode)` | `OutputModeStreaming`（默认）或 `OutputModeNonStreaming` |
 | `WithStreamUsage(enabled)` | 流式请求是否索要 token 用量（默认开） |
 | `WithEndTool(tool)` / `WithEndTools(tools...)` | 追加 end tool |
@@ -517,8 +470,8 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `WithPlanModule(module)` | 注入计划模块 |
 | `WithHTTPClient(client)` | 自定义 HTTP client（代理 / transport） |
 | `WithHTTPHeaders(headers)` | 每个请求附加 header |
-| `WithToolResultMaxBytes(n)` | 单条工具结果进上下文的体积上限（`0` 关闭） |
-| `WithMaxContextTokens(n)` | 模型上下文窗口（token），压缩触发阈值由它推导 |
+| `WithToolResultMaxBytes(n)` | 单条工具结果进上下文的体积上限（默认 256 KiB，`0` 关闭） |
+| `WithMaxContextTokens(n)` | 模型上下文窗口，压缩触发阈值由它推导（默认 1,000,000） |
 | `SetMaxIterations(n)` | 单次 run 的轮次上限（默认 66） |
 
 ### 运行、历史、工具
@@ -526,10 +479,8 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | 方法 | 说明 |
 | --- | --- |
 | `Run(ctx, input) (chan Msg, error)` | 启动一轮 run；error 表示调用方式有问题（如并发调用） |
-| `Result() RunResult` | 已结束 run 的结果：`Answer` / `Stopped` / `Err` |
-| `OutputMode()` | 当前的输出模式（默认流式） |
-| `StreamUsage()` | 流式请求是否索要 token 用量 |
-| `Stop()` | 取消当前 run（`Result().Stopped` 会变成 true） |
+| `Result() RunResult` | 已结束 run 的结果 |
+| `Stop()` | 取消当前 run |
 | `WithHistory(history)` / `History()` | 注入 / 读取 transcript（都是深拷贝） |
 | `HasState()` | 是否已有历史 |
 | `AddTool(tool)` / `GetTool(name)` / `GetTools()` | 工具注册表（`GetTools` 返回副本） |
@@ -546,16 +497,16 @@ type Tool interface {
 }
 
 type ToolResult struct {
-	Success      bool            // end tool 成功才结束 run
-	Error        string          // 失败原因（会进模型上下文）
-	Meta         map[string]any  // 你自己的元信息，运行时不做解释
-	ModelContent string          // 进模型上下文的内容
-	ModelData    map[string]any  // 进模型上下文的结构化数据
-	Events       []Msg           // 只发给前端的事件
+	Success      bool           // end tool 成功才结束 run
+	Error        string         // 失败原因，进模型上下文
+	Meta         map[string]any // 你自己的元信息，运行时不做解释
+	ModelContent string         // 进模型上下文的内容
+	ModelData    map[string]any // 进模型上下文的结构化数据
+	Events       []Msg          // 只发给产品侧的事件
 }
 
 type Msg struct {
-	Type    string
+	Type    string // reasoning / content / usage；工具事件可以是任意自定义类型
 	Content string
 	Name    string
 	Data    map[string]any
@@ -563,24 +514,17 @@ type Msg struct {
 
 type ToolEventEmitter func(Msg)
 
-// 运行时发出的消息类型
-const (
-	MsgTypeReasoning = "reasoning" // 模型的思考内容
-	MsgTypeContent   = "content"   // 回答正文
-	MsgTypeUsage     = "usage"     // 单次调用的 token 用量，放在 Data 里
-)
-
 type RunResult struct {
 	Answer   string     // end tool 返回的最终内容
-	Stopped  bool       // 是否被取消（Stop / ctx 取消 / 超时）
+	Stopped  bool       // 被取消（Stop、context 取消或超时）
 	Err      error      // 失败原因
-	Usage    TokenUsage // 整个 run 累加的 token 用量
-	LLMCalls int        // 有多少次 LLM 调用报了用量
+	Usage    TokenUsage // 整轮累加
+	LLMCalls int        // 上报过用量的调用次数
 }
 
 type TokenUsage struct {
-	PromptTokens     int // 输入 token
-	CompletionTokens int // 输出 token
+	PromptTokens     int
+	CompletionTokens int
 	TotalTokens      int
 	Model            string
 	CachedTokens     int // 可选，取决于 provider
@@ -590,8 +534,8 @@ type TokenUsage struct {
 type OutputMode string
 
 const (
-	OutputModeStreaming    OutputMode = "streaming"     // 生成过程中就发消息
-	OutputModeNonStreaming OutputMode = "non_streaming" // 每次回复只发一条
+	OutputModeStreaming    OutputMode = "streaming"
+	OutputModeNonStreaming OutputMode = "non_streaming"
 )
 ```
 
@@ -611,14 +555,26 @@ const (
 | `eventChannelBuffer` | 256 | `Run` 返回 channel 的缓冲 |
 | `logContentMaxRunes` | 2000 | 日志内容截断长度 |
 
-### 日志
+---
 
-```go
-xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / info / warn / error / off
-```
+## 运行规则
 
-默认 `info`；`logMessageSizes`（每轮消息体积与 token 估算）是 `debug`。所有日志行都带 `chat_id=`，
-模型输出、工具参数与结果都会被截断。
+1. 构造函数必须传至少一个 end tool，否则 `panic`。
+2. 只有 end tool 成功返回才能结束 run；纯文本回答会被退回给模型。
+3. end tool 返回 `Success=false` 或 error 都不结束 run。
+4. 连续 2 次纯文本回答 → 下一次请求强制 `tool_choice=required`；连续 5 次 → run 失败。
+5. 同一轮里排在 end tool 之后的工具调用会写成「已跳过」占位，保证 transcript 合法。
+6. LLM 传输失败退避重试 3 次（500ms → 1s），失败原因保留在 `Result().Err` 里。
+7. 工具 panic 会被兜进 `Result().Err`，进程不受影响，run 槽位一定释放。
+8. 单条工具结果超过 `WithToolResultMaxBytes` 时，负载被替换成带 `"truncated": true` 的裁剪版。
+9. run 结束时 channel 关闭，结果只在 `Result()` 里。
+10. end tool 的最终答案作为最后一条 `content` 消息出现在流里，同时镜像到 `Result().Answer`。
+11. 每次 LLM 调用只要 provider 返回了 token 用量，就发一条 `usage` 消息，并累加到 `Result().Usage`。
+12. 上下文压缩在构建请求之前检查，依据是上一次调用返回的 `prompt_tokens`；摘要失败则本次压缩作废，
+    transcript 原样保留。
+
+发送前 `sanitizeMessagesForLLM` 会清空每条消息的 `Name`，并把空的 `Content` / `ReasoningContent`
+替换成一个空格（不少 provider 会拒绝空字符串），所以内存里的 transcript 与实际报文有这点差异。
 
 ---
 
@@ -626,19 +582,19 @@ xlog.SetLevel(xlog.ParseLevel(os.Getenv("GOER_AGENT_LOG_LEVEL"))) // debug / inf
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 编译报 `unknown field ExtraBody` / `ReasoningContent` | 漏了 `replace` 指令——按「安装」一节补到自己的 `go.mod`。 |
-| `Result().Err` 为 `llm call failed after 3 attempts (model=…)` | token 错、base URL 错，或网关不可用。包装的原始原因就在错误里。 |
-| `Result().Err` 为 `agent replied without calling a tool 5 times in a row` | 模型一直只说话不调工具。在 system prompt 里明确「只有 `finish` 能结束任务」，或把 `finish` 做得更好调（参数更少更简单）。 |
+| 编译报 unknown field `ExtraBody` / `ReasoningContent` | 漏了 `replace` 指令，见「安装」。 |
+| `Result().Err` 为 `llm call failed after 3 attempts (model=…)` | token 错、base URL 错，或上游不可用。原始原因包在错误里。 |
+| `Result().Err` 为 `agent replied without calling a tool 5 times in a row` | 模型一直只说话不调工具。在 system prompt 里明确「只有 `finish` 能结束任务」，或把 `finish` 做得更好调。 |
 | `Result().Err` 为 `agent execution exceeded max iterations (66)` | 轮次不够或某个工具一直失败。调大 `SetMaxIterations`，或修工具。 |
-| 续话时 HTTP 400 | 历史里 assistant 的 `tool_calls` 没有配对的 tool 结果。落库时每条 tool 消息的 `tool_call_id` 必须原样保留。 |
-| run 一直不结束 | 没注册 end tool，或工具名与模型调用的名字不一致。检查 `agent.EndToolNames()`。 |
-| 模型自己写的最终文本没出现在答案里 | 答案只取 end tool 的 `ModelContent`。让 `finish` 返回你想展示的文本；只有它为空时才会回退到模型最后的文本。 |
-| 工具结果像是被截断了 | 超过了 `WithToolResultMaxBytes`，负载被替换成带 `"truncated": true` 的裁剪版。调大上限或让工具少返回一些。 |
-| `Run` 返回 `agent is already running` | 一个实例一次只跑一个 run。每个请求新建实例（案例 14）。 |
+| 继续对话时被上游拒（HTTP 400） | 存下来的历史里有 `tool_calls` 但没有配对的工具结果。每条 tool 消息的 `tool_call_id` 要原样保存。 |
+| run 一直不结束 | 没注册 end tool，或名字与模型调用的不一致。检查 `agent.EndToolNames()`。 |
+| 模型自己写的最终文本没进答案 | 答案只取 end tool 的 `ModelContent`；只有它为空时才回退到模型最后的文本。 |
+| 工具结果像是被截断了 | 超过 `WithToolResultMaxBytes`。调大上限，或让工具少返回一些。 |
+| `Run` 返回 `agent is already running` | 一个实例一次只跑一个 run。每个请求新建实例。 |
 | 回答语言不对 | 用 `WithLang("zh-CN")`，语言只由这个选项控制。 |
-| 模型思考时前端没有任何输出 | 运行时只发 `reasoning` 和 `content`；模型没有推理内容时中途就没有输出，最终答案只在 `Result().Answer` 里。 |
-| 内容是一次性出现的、没有流式效果 | agent 处于 `OutputModeNonStreaming`。改成 `OutputModeStreaming`（默认）即可，或干脆不调用 `WithOutputMode`。 |
-| 没有 `usage` 消息，或 token 数量全是 0 | provider/网关没有返回用量。流式请求通过 `stream_options.include_usage` 主动索要；如果网关不接受该参数，用 `WithStreamUsage(false)` 关掉，再从业侧日志里取用量。 |
+| 模型思考时前端没有任何输出 | 运行时只发 `reasoning` 和 `content`；模型没有推理内容时中途就没有输出。 |
+| 内容一次性出现、没有流式效果 | agent 处于 `OutputModeNonStreaming`，改成 `OutputModeStreaming`（默认）或干脆不调用 `WithOutputMode`。 |
+| 没有 `usage` 消息，或 token 数量全是 0 | provider 没有返回用量。流式请求通过 `stream_options.include_usage` 主动索要；不接受它的上游可以用 `WithStreamUsage(false)` 关掉。 |
 
 ---
 
@@ -654,8 +610,6 @@ make check       # fmt-check + vet + test
 
 测试共 51 个用例，核心是一个本地 `httptest` 假 LLM（SSE 流式，并记录每次请求），因此可以断言
 `tool_choice`、消息内容、请求头和调用次数。CI 在 `main` 和 PR 上跑同样的检查。
-
----
 
 ## 已知限制
 
