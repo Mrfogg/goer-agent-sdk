@@ -70,6 +70,20 @@ type BaseAgent struct {
 	tools              map[string]Tool // global tool registry
 	endTools           map[string]Tool // the only tools allowed to finish a run
 
+	// maxContextTokens is the model's context window, the input that decides
+	// whether context compaction triggers.
+	maxContextTokens int
+	// lastPromptTokens is the prompt_tokens an LLM call reported most recently
+	// (a post-hoc value). It is the only trustworthy source of "current context
+	// usage": it is updated only when usage is available, so a missing usage keeps
+	// the last known value.
+	lastPromptTokens int
+	// compactionState carries state across compactions (the previous summary and
+	// the verbatim user message list). It only lives in-process: once the history
+	// is persisted and restored in a later turn this state is empty, and
+	// planCompaction then recognizes the previous block from the history itself.
+	compactionState *compactionState
+
 	planModule   PlanModule
 	memoryModule MemoryModule
 
@@ -104,6 +118,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 		authToken:          authToken,
 		baseURL:            baseURL,
 		toolResultMaxBytes: defaultToolResultMaxBytes,
+		maxContextTokens:   defaultMaxContextTokens,
 		tools:              make(map[string]Tool),
 		endTools:           make(map[string]Tool),
 		streamUsage:        true,
@@ -316,6 +331,55 @@ func (a *BaseAgent) SetMaxIterations(n int) *BaseAgent {
 		a.maxIterations = n
 	}
 	return a
+}
+
+// WithMaxContextTokens sets the model's context window in tokens, which context
+// compaction derives its trigger threshold from. A value <= 0 is ignored and the
+// default is kept.
+func (a *BaseAgent) WithMaxContextTokens(tokens int) *BaseAgent {
+	if tokens > 0 {
+		a.maxContextTokens = tokens
+	}
+	return a
+}
+
+// recordPromptTokens records the prompt_tokens an LLM call reported (a post-hoc
+// value). A value <= 0 counts as missing usage and keeps the last known value, so
+// the trigger state is never cleared to 0 by accident.
+func (a *BaseAgent) recordPromptTokens(tokens int) {
+	if tokens > 0 {
+		a.runMu.Lock()
+		a.lastPromptTokens = tokens
+		a.runMu.Unlock()
+	}
+}
+
+// contextCompactionThresholdTokens returns the prompt_tokens threshold that
+// triggers context compaction: the context window times
+// contextCompactionThresholdRatio. The window is the only input; when it is unset
+// (<= 0) defaultMaxContextTokens is used.
+func (a *BaseAgent) contextCompactionThresholdTokens() int {
+	window := a.maxContextTokens
+	if window <= 0 {
+		window = defaultMaxContextTokens
+	}
+	return int(float64(window) * contextCompactionThresholdRatio)
+}
+
+// shouldCompressContext reports whether the prompt_tokens of the most recent call
+// crossed the compaction threshold. With no usable usage (<= 0) it never triggers.
+func (a *BaseAgent) shouldCompressContext(promptTokens int) bool {
+	if promptTokens <= 0 {
+		return false
+	}
+	return promptTokens > a.contextCompactionThresholdTokens()
+}
+
+// contextCompactionKeepTokens returns the token budget kept verbatim by a
+// compaction (a ratio of the trigger threshold). The first compaction derives its
+// cut boundary from this budget.
+func (a *BaseAgent) contextCompactionKeepTokens() int {
+	return int(float64(a.contextCompactionThresholdTokens()) * contextCompactionKeepRatio)
 }
 
 // AddTool registers a tool. Nil tools and tools without a name are ignored.

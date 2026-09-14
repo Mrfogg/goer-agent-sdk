@@ -22,6 +22,7 @@ const fakeLLMBlock = "__block__"
 type fakeLLMRequest struct {
 	authorization string
 	toolChoice    any
+	tools         []openai.Tool
 	messages      []openai.ChatCompletionMessage
 	headers       http.Header
 	stream        bool
@@ -65,6 +66,7 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var request struct {
 		ToolChoice    any                            `json:"tool_choice"`
+		Tools         []openai.Tool                  `json:"tools"`
 		Messages      []openai.ChatCompletionMessage `json:"messages"`
 		Stream        bool                           `json:"stream"`
 		StreamOptions *struct {
@@ -78,6 +80,7 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, fakeLLMRequest{
 		authorization: r.Header.Get("Authorization"),
 		toolChoice:    request.ToolChoice,
+		tools:         request.Tools,
 		messages:      request.Messages,
 		headers:       r.Header.Clone(),
 		stream:        request.Stream,

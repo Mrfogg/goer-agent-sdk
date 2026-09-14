@@ -46,3 +46,21 @@ const (
 	toolChoiceAuto     = "auto"
 	toolChoiceRequired = "required"
 )
+
+// Context compaction. The context window is the only input: the trigger
+// threshold and the verbatim-tail budget are both derived from it by ratio.
+const (
+	// contextCompactionThresholdRatio is the share of the context window at which
+	// compaction triggers: once an LLM call reports prompt_tokens above it, the
+	// transcript is compacted before the next request.
+	contextCompactionThresholdRatio = 0.6
+
+	// contextCompactionKeepRatio is the share of the trigger threshold kept
+	// verbatim after compaction. It is the budget the boundary search works
+	// against: the smaller it is, the harder the transcript is compacted.
+	contextCompactionKeepRatio = 0.25
+
+	// defaultMaxContextTokens is the context window used when the caller did not
+	// set one with WithMaxContextTokens.
+	defaultMaxContextTokens = 1_000_000
+)

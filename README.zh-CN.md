@@ -369,12 +369,16 @@ agent.WithPlanModule(myPlan{}) // Tool() + Prompt() + Reset() + ValidateFinalAns
 ### 12. 控制上下文体积
 
 ```go
+agent.WithMaxContextTokens(128 * 1024)   // 模型上下文窗口：自动压缩的唯一依据
 agent.WithToolResultMaxBytes(128 * 1024) // 过大的工具结果会被替换成裁剪版
 agent.SetMaxIterations(40)               // 单轮 run 的轮次上限（默认 66）
 
-// 下一轮之前自己裁剪历史：
+// 想用自己的策略时，手动裁剪历史依然可以：
 agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
 ```
+
+`WithMaxContextTokens` 打开自动上下文压缩：一旦某次调用返回的 prompt token 越过窗口的触发比例，
+运行时会先把 transcript 压缩好，再构建下一次请求。细节见[上下文压缩](#上下文压缩)。
 
 ### 13. 把一次 run 入库
 
@@ -456,11 +460,35 @@ MODE=non_streaming go run ./examples/localmock # 非流式
 9. end tool 的最终答案会作为最后一条 `content` 消息出现在流里，同时镜像到 `Result().Answer`。
 10. 输出模式：`OutputModeStreaming`（默认）与 `OutputModeNonStreaming` 发出的是同样两种消息，区别只是消息到达的频率。
 11. 每次 LLM 调用只要provider 返回了 token 用量，就会发一条 `usage` 消息，并累加到 `Result().Usage`，调用次数记在 `Result().LLMCalls`。流式请求通过 `stream_options.include_usage` 主动索要该字段，遇到不接受它的网关可以用 `WithStreamUsage(false)` 关掉。
+12. 上下文压缩在构建请求之前检查，依据是上一次调用返回的 `prompt_tokens`。摘要调用失败时本次压缩作废，transcript 原样保留。
 
 ### 模型实际收到的消息
 
 发送前 `sanitizeMessagesForLLM` 会清空每条消息的 `Name`，并把空的 `Content` / `ReasoningContent`
 替换成一个空格（不少 provider 会拒绝空字符串）。所以内存里的 transcript 与实际发出的报文有这点差异。
+
+---
+
+## 上下文压缩
+
+长对话最终会撑爆模型的上下文窗口。运行时不会就此报错，而是压缩 transcript，且**上下文窗口是唯一的
+计算依据**。
+
+- **触发**：最近一次调用返回的 `prompt_tokens`（事后值；用量缺失时永不触发）超过
+  `WithMaxContextTokens × 0.6`。默认窗口 1,000,000。
+- **预算**：压缩后逐字保留的尾部 = 触发阈值 × 0.25。
+- **裁剪点**：优先切在 `user` 消息（轮次起点）；若最新一轮单独就超预算，就钻进该轮内部的
+  `assistant` 迭代点；最后才退到 `assistant` 之间。`system` 永不进压缩区，`tool` 消息永远不能做
+  裁剪点——工具结果不能脱离它所应答的那次调用单独发出。
+- **产物**：被压段替换成一条 `user` 消息：`<compacted-history>` + 结构化摘要（8 个固定章节）+
+  最多 40 条 user 消息逐字清单 + 续接契约。摘要由模型生成（不带工具、`max_tokens=3000`）；逐字清单
+  由纯代码抽取、完全不经过模型，所以即使摘要模型跑偏，用户原话也不会丢。
+- **失败**：摘要调用失败则本次压缩作废，transcript 保持原样，run 继续。
+- **重复压缩**：压缩块会顶到 history 头部，下一次压缩跳过它，只压其后的增长段，并把上一次的摘要
+  折叠进新摘要。
+
+压缩块就是普通历史：跟着 transcript 一起入库，用 `WithHistory` 恢复即可。压缩状态本身是进程内的，
+恢复回来的压缩块靠结构特征识别。
 
 ---
 
@@ -490,6 +518,7 @@ func NewBaseAgent(name, description, systemPrompt, model, authToken, baseURL str
 | `WithHTTPClient(client)` | 自定义 HTTP client（代理 / transport） |
 | `WithHTTPHeaders(headers)` | 每个请求附加 header |
 | `WithToolResultMaxBytes(n)` | 单条工具结果进上下文的体积上限（`0` 关闭） |
+| `WithMaxContextTokens(n)` | 模型上下文窗口（token），压缩触发阈值由它推导 |
 | `SetMaxIterations(n)` | 单次 run 的轮次上限（默认 66） |
 
 ### 运行、历史、工具
@@ -572,6 +601,9 @@ const (
 | --- | --- | --- |
 | `defaultMaxIterations` | 66 | 单次 run 的模型轮次上限 |
 | `defaultToolResultMaxBytes` | 256 KiB | 单条工具结果进上下文的体积上限 |
+| `defaultMaxContextTokens` | 1,000,000 | 未显式设置时的上下文窗口 |
+| `contextCompactionThresholdRatio` | 0.6 | 窗口的该比例即触发上下文压缩 |
+| `contextCompactionKeepRatio` | 0.25 | 压缩后逐字保留的尾部占触发阈值的比例 |
 | `noToolCallEscalateAfter` | 2 | 连续多少次纯文本后强制 `tool_choice=required` |
 | `noToolCallFailAfter` | 5 | 连续多少次纯文本后 run 失败 |
 | `llmMaxAttempts` | 3 | 单次 LLM 调用尝试次数 |
@@ -620,7 +652,7 @@ make test-race
 make check       # fmt-check + vet + test
 ```
 
-测试共 20 个用例，核心是一个本地 `httptest` 假 LLM（SSE 流式，并记录每次请求），因此可以断言
+测试共 51 个用例，核心是一个本地 `httptest` 假 LLM（SSE 流式，并记录每次请求），因此可以断言
 `tool_choice`、消息内容、请求头和调用次数。CI 在 `main` 和 PR 上跑同样的检查。
 
 ---
@@ -628,10 +660,12 @@ make check       # fmt-check + vet + test
 ## 已知限制
 
 1. fork 依赖（见「安装」）需要每个使用方各自声明 `replace`。
-2. 运行时不会自动裁剪 transcript，长对话需要你自己处理（案例 12）。
+2. 压缩状态（上一次摘要、逐字 user 消息清单）是进程内的。用 `WithHistory` 恢复的历史依然能正确压缩
+   ——头部的压缩块靠结构特征识别——但计数与摘要折叠会从该块重新起步。
 
 ## 与后端实现的关系
 
 本 SDK 与 `golang-backend/agents/orchestratorv2/agent/base` 同源。后端那份保留平台依赖
 （`llm.Client()` 读环境变量、`locales`、`utils`），本 SDK 把 token / base URL、记忆块、日志、
-HTTP 客户端都参数化。两边的 end-tool 语义一致——改动其一记得同步另一边。
+HTTP 客户端、摘要模型都参数化。两边的 end-tool 与上下文压缩语义一致——`compaction.go` 与
+`compress.go` 要求逐行可比，改动其一记得同步另一边。

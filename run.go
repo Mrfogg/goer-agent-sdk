@@ -153,6 +153,126 @@ func (a *BaseAgent) failRun(ctx context.Context, err error) {
 	a.setRunResult(RunResult{Err: err, Usage: usage, LLMCalls: calls})
 }
 
+// maybeCompressContext decides from the prompt_tokens of the most recent LLM call
+// (a post-hoc value) whether to compact the context, and runs before every request
+// is assembled. It never triggers when no usage is available.
+func (a *BaseAgent) maybeCompressContext(ctx context.Context) {
+	a.runMu.Lock()
+	promptTokens := a.lastPromptTokens
+	historyMessages := len(a.agentHistory)
+	a.runMu.Unlock()
+
+	if !a.shouldCompressContext(promptTokens) {
+		return
+	}
+
+	window := a.maxContextTokens
+	if window <= 0 {
+		window = defaultMaxContextTokens
+	}
+	agentLogInfo(
+		ctx,
+		"context compaction triggered: prompt_tokens=%d threshold_tokens=%d max_context_tokens=%d history_messages=%d",
+		promptTokens,
+		a.contextCompactionThresholdTokens(),
+		window,
+		historyMessages,
+	)
+	a.compressContext(ctx)
+}
+
+// compressContext compacts a.agentHistory so the next LLM call fits the context
+// budget again.
+//
+// The cut point comes from planCompaction (see compress.go) and the compacted span
+// becomes history[spanStart:boundary]. Its output is produced by compaction.go: an
+// LLM summary (line A) plus a verbatim user message list (line B), joined into one
+// role=user block that replaces the span, while everything after boundary is kept
+// verbatim.
+//
+// Only agentHistory changes — the system prompt is rebuilt by buildMessages on every
+// request and never enters the compacted span. Any failure leaves the history
+// untouched so the next trigger can retry.
+func (a *BaseAgent) compressContext(ctx context.Context) {
+	keepTokens := a.contextCompactionKeepTokens()
+
+	// Snapshot under the lock and call the summarizer outside it: the history is only
+	// mutated by this run loop, and a concurrent History() reader must not block on a
+	// network round trip.
+	a.runMu.Lock()
+	history := cloneMessages(a.agentHistory)
+	spanStart, boundary := planCompaction(history, keepTokens)
+	if spanStart == 0 && boundary == 0 {
+		a.runMu.Unlock()
+		agentLogInfo(ctx, "context compaction skipped: no eligible boundary (keep_tokens=%d)", keepTokens)
+		return
+	}
+
+	// Line A: fold the previous summary in, then hand the span to the summarizer for
+	// a structured summary. When the state is missing (history restored from a store)
+	// the previous block at the head is treated as the previous summary, so what it
+	// holds still gets folded into the new one.
+	prevSummary := ""
+	switch {
+	case a.compactionState != nil:
+		prevSummary = a.compactionState.summary
+	case spanStart == 1 && isCompactionBlock(history[0]):
+		prevSummary = history[0].Content
+	}
+	var prevUserMessages []string
+	cumulativeDropped := 0
+	if a.compactionState != nil {
+		prevUserMessages = a.compactionState.userMessages
+		cumulativeDropped = a.compactionState.userMsgsDropped
+	}
+	a.runMu.Unlock()
+
+	span := history[spanStart:boundary]
+	userContent := buildSummarizerUserContent(prevSummary, span)
+	summary, err := summarizeCompactionSpan(ctx, a.client, a.compactionModel(), userContent)
+	if err != nil {
+		agentLogError(ctx, "context compaction aborted, history untouched: %v", err)
+		return
+	}
+
+	// Line B: plain code extracts and accumulates user messages (dropped counts
+	// accumulate across compactions too).
+	combined, dropped := accumulateUserMessages(prevUserMessages, extractUserMessages(span))
+	cumulativeDropped += dropped
+
+	// Replace history[spanStart:boundary] with the block, keeping the tail verbatim.
+	block := buildCompactionMessage(summary, combined, cumulativeDropped)
+	newHistory := make([]openai.ChatCompletionMessage, 0, 1+len(history)-boundary)
+	newHistory = append(newHistory, block)
+	newHistory = append(newHistory, history[boundary:]...)
+
+	a.runMu.Lock()
+	a.agentHistory = newHistory
+	a.compactionState = &compactionState{
+		summary:         summary,
+		userMessages:    combined,
+		userMsgsDropped: cumulativeDropped,
+	}
+	estimatedTokensAfter := estimateMessagesTokens(newHistory)
+	a.runMu.Unlock()
+
+	agentLogInfo(
+		ctx,
+		"context compaction done: compacted_messages=%d kept_messages=%d boundary=%d estimated_tokens_after=%d",
+		boundary-spanStart,
+		len(newHistory)-1,
+		boundary,
+		estimatedTokensAfter,
+	)
+}
+
+// compactionModel returns the summarizer model. The agent's own model is the only
+// source: this SDK parameterizes the model instead of reading it from the
+// environment.
+func (a *BaseAgent) compactionModel() string {
+	return a.model
+}
+
 // runWithTools drives the tool-calling loop: every iteration is one assistant
 // reply, and the run only finishes when an end tool succeeds.
 //
@@ -186,6 +306,10 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 			return
 		}
 
+		// Compaction is checked before the next request is built: it uses the
+		// prompt_tokens the previous call reported (a post-hoc value) and rewrites the
+		// history about to be sent to the model.
+		a.maybeCompressContext(ctx)
 		messages := a.buildMessages(a.systemPrompt)
 		logMessageSizes(ctx, messages)
 
@@ -212,6 +336,7 @@ func (a *BaseAgent) runWithTools(ctx context.Context, input string, emit ToolEve
 		if response.Usage != nil {
 			emit(usageMessage(*response.Usage))
 			a.addRunUsage(*response.Usage)
+			a.recordPromptTokens(response.Usage.PromptTokens)
 		}
 
 		assistantMessage := response.Message

@@ -381,12 +381,17 @@ answer is emitted (a failing validation auto-completes the pending tasks and emi
 ### 12. Keep the context small
 
 ```go
+agent.WithMaxContextTokens(128 * 1024)   // the model's window: drives automatic compaction
 agent.WithToolResultMaxBytes(128 * 1024) // oversized tool results become a clipped payload
 agent.SetMaxIterations(40)               // cap turns per run (default 66)
 
-// trim history yourself before the next turn:
+// trimming the transcript by hand is still fine when you want your own policy:
 agent.WithHistory(lastNMessages(loadHistory(chatID), 30))
 ```
+
+`WithMaxContextTokens` turns on automatic context compaction: once a call reports more prompt
+tokens than the window's trigger ratio, the runtime compacts the transcript before building the
+next request. See [Context compaction](#context-compaction).
 
 ### 13. Persist a run
 
@@ -477,12 +482,42 @@ MODE=non_streaming go run ./examples/localmock # non-streaming
     `Result().Usage` with `Result().LLMCalls`. Streaming requests ask the provider for it with
     `stream_options.include_usage`; `WithStreamUsage(false)` turns that off for gateways that
     reject it.
+12. Context compaction is checked before a request is built, from the `prompt_tokens` of the
+    previous call. When the summarizer call fails, the compaction is aborted and the transcript is
+    left exactly as it was.
 
 ### What the model actually receives
 
 `sanitizeMessagesForLLM` clears every message `Name`, and replaces empty `Content` /
 `ReasoningContent` with a single space (several providers reject empty strings). The in-memory
 transcript and the wire payload therefore differ slightly.
+
+---
+
+## Context compaction
+
+A long run eventually outgrows the model's context window. The runtime compacts the transcript
+instead of failing, and it does so with the window as the only input.
+
+- **Trigger** — the `prompt_tokens` the most recent call reported (a post-hoc value; a missing
+  usage never triggers) above `WithMaxContextTokens × 0.6`. The default window is 1,000,000.
+- **Budget** — the verbatim tail kept after a compaction is `threshold × 0.25`.
+- **Cut point** — the split lands on a `user` message (a turn boundary) whenever one fits the
+  budget, inside the newest turn when that turn alone blows it, and between `assistant` steps as a
+  last resort. `system` never enters the compacted span, and a `tool` message is never a cut
+  point: a tool result cannot be sent without the call it answers.
+- **Output** — the compacted span is replaced by a single `user` message: `<compacted-history>`,
+  a structured summary (eight fixed sections), a verbatim list of up to 40 user messages, and the
+  continuation contract. The summary comes from the model (no tools, `max_tokens=3000`); the
+  verbatim list is extracted by plain code and never passes through the model, so the user's own
+  words survive a bad summarizer.
+- **Failure** — a failed summarizer call leaves the transcript untouched and the run continues.
+- **Repeating** — the block replaces the span at the head of the history, so the next compaction
+  skips it and only compacts the growth after it, folding the previous summary into the new one.
+
+The block is ordinary history: persist it with the rest of the transcript and restore it with
+`WithHistory`. Compaction state itself lives in-process, and a restored block is recognized
+structurally instead.
 
 ---
 
@@ -513,6 +548,7 @@ are skipped; at least one usable end tool is required.
 | `WithHTTPClient(client)` | Custom HTTP client (proxy / transport) |
 | `WithHTTPHeaders(headers)` | Extra headers on every request |
 | `WithToolResultMaxBytes(n)` | Cap one tool result entering the context (`0` disables) |
+| `WithMaxContextTokens(n)` | Model context window in tokens, which compaction derives its trigger from |
 | `SetMaxIterations(n)` | Turn cap per run (default 66) |
 
 ### Running, history, tools
@@ -595,6 +631,9 @@ const (
 | --- | --- | --- |
 | `defaultMaxIterations` | 66 | Assistant turns per run |
 | `defaultToolResultMaxBytes` | 256 KiB | Cap per tool result |
+| `defaultMaxContextTokens` | 1,000,000 | Context window when none is set |
+| `contextCompactionThresholdRatio` | 0.6 | Share of the window that triggers compaction |
+| `contextCompactionKeepRatio` | 0.25 | Share of the threshold kept verbatim |
 | `noToolCallEscalateAfter` | 2 | Text-only replies before forcing `tool_choice=required` |
 | `noToolCallFailAfter` | 5 | Text-only replies before failing the run |
 | `llmMaxAttempts` | 3 | Attempts per LLM call |
@@ -643,7 +682,7 @@ make test-race
 make check       # fmt-check + vet + test
 ```
 
-The suite (20 tests) runs against a local `httptest` fake LLM that streams SSE and records every
+The suite (51 tests) runs against a local `httptest` fake LLM that streams SSE and records every
 request, so it can assert `tool_choice`, message contents, headers and call counts. CI runs the
 same checks on `main` and on pull requests.
 
@@ -652,12 +691,15 @@ same checks on `main` and on pull requests.
 ## Known limitations
 
 1. The fork dependency (see Installation) must be repeated by every consumer.
-2. The runtime does not trim the transcript — long conversations need your own strategy
-   (recipe 12).
+2. Compaction state (the previous summary and the verbatim user message list) lives in-process. A
+   transcript restored with `WithHistory` still compacts correctly, because the block at its head
+   is recognized structurally, but the counters and the summary fold start over from that block.
 
 ## Relationship to the backend copy
 
 This SDK shares its origin with `golang-backend/agents/orchestratorv2/agent/base`. The backend
 copy keeps platform dependencies (`llm.Client()` reading environment variables, `locales`,
-`utils`); this one parameterizes token / base URL, memory block, logging and HTTP client. Both
-follow the same end-tool semantics — keep them in sync when changing either.
+`utils`); this one parameterizes token / base URL, memory block, logging, HTTP client and the
+summarizer model. Both follow the same end-tool and context-compaction semantics — `compaction.go`
+and `compress.go` are meant to stay line-by-line comparable, so keep them in sync when changing
+either.
