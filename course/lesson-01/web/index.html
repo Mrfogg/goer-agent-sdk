@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第一课 · Hello World Agent</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="badge">lesson 01</span>
+    <div>
+      <h1>Hello World Agent</h1>
+      <p>一次提问 = 一次工具循环；只有 <code>finish</code> 成功返回，这一轮才结束</p>
+    </div>
+  </div>
+  <div class="actions">
+    <label class="switch">
+      <input type="checkbox" id="show-reasoning" checked>
+      显示思考过程
+    </label>
+    <button id="reset" class="ghost" type="button">新会话</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="chat">
+    <div id="messages" class="messages">
+      <div class="empty">
+        <h2>先问一句试试</h2>
+        <p>比如「现在几点？」——模型会调用 <code>now</code> 工具拿时间，再用 <code>finish</code> 交付答案。</p>
+        <p>留意右边：哪一步发生了什么、以及原始 SSE 事件长什么样。</p>
+      </div>
+    </div>
+
+    <form id="composer" class="composer">
+      <textarea id="input" rows="1" placeholder="问点什么…"></textarea>
+      <button id="send" type="submit">发送</button>
+      <button id="stop" class="danger" type="button" hidden>停止</button>
+    </form>
+    <p class="hint">回车发送 · Shift + 回车换行 · 运行中点「停止」会中断这一轮 run</p>
+  </section>
+
+  <aside class="panel">
+    <h2>这一轮发生了什么</h2>
+    <ol id="steps" class="steps">
+      <li data-step="request"><b>1</b> 发送请求 <span>POST /api/chat</span></li>
+      <li data-step="model"><b>2</b> 模型思考 <span>reasoning / content</span></li>
+      <li data-step="tool"><b>3</b> 调用工具 <span>普通工具：结果写回 transcript</span></li>
+      <li data-step="deliver"><b>4</b> end tool 交付 <span>finish 成功 → run 结束</span></li>
+    </ol>
+
+    <div class="note">
+      <h3>看这三点</h3>
+      <ul>
+        <li><b>文本不结束任务。</b>模型如果只用文字回答，会被退回去重新调用工具——右边第 2 步会重复出现。</li>
+        <li><b>工具是两条通道。</b>工具卡片来自 <code>ToolResult.Events</code>，前端能看到，但模型上下文里没有。</li>
+        <li><b>答案来自 end tool。</b>最后那段标注「交付答案」的文本，是 <code>finish</code> 的 <code>ModelContent</code>，不是模型最后的自言自语。</li>
+      </ul>
+    </div>
+
+    <h2 class="raw-title">
+      原始 SSE 事件
+      <button id="toggle-raw" class="ghost small" type="button">显示</button>
+    </h2>
+    <pre id="raw" class="raw" hidden></pre>
+  </aside>
+
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
