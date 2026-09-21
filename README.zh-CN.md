@@ -386,6 +386,23 @@ func (myMemory) BuildPromptBlock(ctx context.Context) string {
 agent.WithMemory(myMemory{}) // 注册它的工具 + 追加提示词段落
 ```
 
+SDK 也自带一个现成实现 `memorykit`：基于 SQLite（gorm）的按用户存储，带 `memory_write`、
+`memory_merge`、`memory_forget` 三个工具，一段列出已知记忆的提示词，以及会拒绝密钥类文本的写入
+路径。合并需要一次模型调用，所以只有你注入合并器时才会注册合并工具：
+
+```go
+module, err := memorykit.New("memories.db", userID,
+	memorykit.WithMerger(memorykit.NewOpenAIMerger(client, model)),
+)
+if err != nil {
+	return err
+}
+agent.WithMemory(module)
+```
+
+一个模块只存一个用户的记忆；服务多用户时按用户各建一个模块（或把已有 gorm 句柄交给
+`NewWithDB`）。
+
 计划模块多两个钩子：`Reset()` 每轮 run 开始时调用，`ValidateFinalAnswer(ctx)` 在答案发出前校验
 （校验失败会自动完成剩余任务并发出一条事件）。
 

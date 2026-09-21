@@ -406,6 +406,24 @@ func (myMemory) BuildPromptBlock(ctx context.Context) string {
 agent.WithMemory(myMemory{}) // registers its tools + appends its prompt block
 ```
 
+A ready-made implementation ships as `memorykit`: a per-user store on SQLite (gorm) with
+`memory_write`, `memory_merge` and `memory_forget`, a prompt block listing what the agent already
+knows, and a write path that refuses credential-shaped text. Merging is a model call, so the merge
+tool only exists when you supply one:
+
+```go
+module, err := memorykit.New("memories.db", userID,
+	memorykit.WithMerger(memorykit.NewOpenAIMerger(client, model)),
+)
+if err != nil {
+	return err
+}
+agent.WithMemory(module)
+```
+
+One module holds one user's memories, so an application serving many users builds one module per
+user (or hands `NewWithDB` a handle it already owns).
+
 A plan module adds two hooks: `Reset()` runs at the start of every run, and `ValidateFinalAnswer(ctx)`
 runs just before the answer is emitted (a failing validation auto-completes the pending tasks and
 emits an event).
