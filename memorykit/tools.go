@@ -25,6 +25,44 @@ func (m *Module) Tools() []base.Tool {
 	return append(tools, &forgetTool{module: m})
 }
 
+// MemoryEventType is the stream event the memory tools emit on the product
+// side, through ToolResult.Events. A product UI renders it to show what the
+// agent just remembered, rewrote, folded or deleted; the model never sees it,
+// which is why Data is the whole payload the frontend needs.
+const MemoryEventType = "memory"
+
+// The actions a MemoryEventType event reports in Data["action"].
+const (
+	memoryActionSaved     = "saved"
+	memoryActionRewritten = "rewritten"
+	memoryActionMerged    = "merged"
+	memoryActionDeleted   = "deleted"
+	memoryActionRejected  = "rejected"
+)
+
+// rejectMemory builds a refused result. The reason travels both ways: the model
+// reads it as the tool's error and reacts to it, and the product side sees it as
+// a memory event — a refusal is part of the story the UI has to show, so it must
+// not look like nothing happened.
+func rejectMemory(data map[string]any, reason string) base.ToolResult {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["action"] = memoryActionRejected
+	data["error"] = reason
+	return base.ToolResult{
+		Success: false,
+		Error:   reason,
+		Events:  []base.Msg{{Type: MemoryEventType, Data: data}},
+	}
+}
+
+// mergeLeftUntouched is the shared tail of every merge failure: a failed merge
+// never half-applies, so the model is told the sources are still there.
+func mergeLeftUntouched(reason string) string {
+	return "merge failed, memories left untouched: " + reason
+}
+
 // =========================
 // memory_write
 // =========================
@@ -59,19 +97,24 @@ func (t *writeTool) OpenAIFunctionDefinition() *openai.FunctionDefinition {
 func (t *writeTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	content := strings.TrimSpace(stringArg(args["content"]))
 	if content == "" {
-		return base.ToolResult{Success: false, Error: "content is required"}, nil
+		return rejectMemory(nil, "content is required"), nil
 	}
 	if kind, found := detectSensitive(content); found {
-		return base.ToolResult{Success: false, Error: sensitiveError(kind)}, nil
+		return rejectMemory(nil, sensitiveError(kind)), nil
 	}
 
 	record, previous, err := t.module.Save(ctx, content, stringArg(args["memory_id"]))
 	if err != nil {
-		return base.ToolResult{Success: false, Error: err.Error()}, nil
+		return rejectMemory(map[string]any{"memory_id": stringArg(args["memory_id"])}, err.Error()), nil
 	}
 
 	modelContent := fmt.Sprintf("Saved memory %s: %s", memoryRef(record), record.Content)
 	modelData := map[string]any{
+		"memory_id": record.ID,
+		"content":   record.Content,
+	}
+	event := map[string]any{
+		"action":    memoryActionSaved,
 		"memory_id": record.ID,
 		"content":   record.Content,
 	}
@@ -80,12 +123,15 @@ func (t *writeTool) Execute(ctx context.Context, args map[string]any) (base.Tool
 		modelContent = fmt.Sprintf("Rewrote memory %s: %s", memoryRef(record), record.Content)
 		modelContent += fmt.Sprintf("\nIt replaced: %s", previous.Content)
 		modelData["replaced"] = map[string]any{"content": previous.Content}
+		event["action"] = memoryActionRewritten
+		event["replaced"] = previous.Content
 	}
 
 	return base.ToolResult{
 		Success:      true,
 		ModelContent: modelContent,
 		ModelData:    modelData,
+		Events:       []base.Msg{{Type: MemoryEventType, Data: event}},
 	}, nil
 }
 
@@ -124,19 +170,19 @@ func (t *mergeTool) OpenAIFunctionDefinition() *openai.FunctionDefinition {
 func (t *mergeTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	ids := uniqueIDs(stringSliceArg(args["memory_ids"]))
 	if len(ids) < mergeMinSources {
-		return base.ToolResult{
-			Success: false,
-			Error:   fmt.Sprintf("memory_ids needs at least %d distinct ids", mergeMinSources),
-		}, nil
+		return rejectMemory(
+			map[string]any{"memory_ids": ids},
+			fmt.Sprintf("memory_ids needs at least %d distinct ids", mergeMinSources),
+		), nil
 	}
 
 	sources, err := t.module.load(ctx, ids)
 	if err != nil {
-		return base.ToolResult{Success: false, Error: err.Error()}, nil
+		return rejectMemory(map[string]any{"memory_ids": ids}, err.Error()), nil
 	}
 
 	if t.module.merger == nil {
-		return base.ToolResult{Success: false, Error: "memory merging is not configured"}, nil
+		return rejectMemory(map[string]any{"memory_ids": ids}, "memory merging is not configured"), nil
 	}
 
 	contents := make([]string, 0, len(sources))
@@ -147,24 +193,18 @@ func (t *mergeTool) Execute(ctx context.Context, args map[string]any) (base.Tool
 	merged, err := t.module.merger.Merge(ctx, contents)
 	if err != nil {
 		xlog.Warn("memory merge failed: uid=%d ids=%v err=%v", t.module.uid, ids, err)
-		return base.ToolResult{
-			Success: false,
-			Error:   "merge failed, memories left untouched: " + err.Error(),
-		}, nil
+		return rejectMemory(map[string]any{"memory_ids": ids}, mergeLeftUntouched(err.Error())), nil
 	}
 
 	text, err := validateMergeOutput(sources, merged)
 	if err != nil {
 		xlog.Warn("memory merge rejected: uid=%d ids=%v err=%v", t.module.uid, ids, err)
-		return base.ToolResult{
-			Success: false,
-			Error:   "merge failed, memories left untouched: " + err.Error(),
-		}, nil
+		return rejectMemory(map[string]any{"memory_ids": ids}, mergeLeftUntouched(err.Error())), nil
 	}
 
 	record, err := t.module.replaceWith(ctx, sources, text)
 	if err != nil {
-		return base.ToolResult{Success: false, Error: err.Error()}, nil
+		return rejectMemory(map[string]any{"memory_ids": ids}, err.Error()), nil
 	}
 
 	foldedIDs := make([]string, 0, len(sources))
@@ -190,6 +230,13 @@ func (t *mergeTool) Execute(ctx context.Context, args map[string]any) (base.Tool
 			"source_count": len(sources),
 			"folded":       folded,
 		},
+		Events: []base.Msg{{Type: MemoryEventType, Data: map[string]any{
+			"action":      memoryActionMerged,
+			"memory_id":   record.ID,
+			"content":     record.Content,
+			"merged_from": foldedIDs,
+			"folded":      folded,
+		}}},
 	}, nil
 }
 
@@ -227,18 +274,18 @@ func (t *forgetTool) OpenAIFunctionDefinition() *openai.FunctionDefinition {
 func (t *forgetTool) Execute(ctx context.Context, args map[string]any) (base.ToolResult, error) {
 	memoryID := strings.TrimSpace(stringArg(args["memory_id"]))
 	if memoryID == "" {
-		return base.ToolResult{Success: false, Error: "memory_id is required"}, nil
+		return rejectMemory(nil, "memory_id is required"), nil
 	}
 
 	// The quote is verified before the lookup so a rejected call cannot reveal
 	// whether an id exists.
 	if err := VerifyUserQuote(ctx, stringArg(args["user_quote"])); err != nil {
-		return base.ToolResult{Success: false, Error: err.Error()}, nil
+		return rejectMemory(map[string]any{"memory_id": memoryID}, err.Error()), nil
 	}
 
 	record, err := t.module.Forget(ctx, memoryID)
 	if err != nil {
-		return base.ToolResult{Success: false, Error: err.Error()}, nil
+		return rejectMemory(map[string]any{"memory_id": memoryID}, err.Error()), nil
 	}
 
 	return base.ToolResult{
@@ -249,6 +296,11 @@ func (t *forgetTool) Execute(ctx context.Context, args map[string]any) (base.Too
 			"content":   record.Content,
 			"deleted":   true,
 		},
+		Events: []base.Msg{{Type: MemoryEventType, Data: map[string]any{
+			"action":    memoryActionDeleted,
+			"memory_id": record.ID,
+			"content":   record.Content,
+		}}},
 	}, nil
 }
 

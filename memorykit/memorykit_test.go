@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	base "github.com/Mrfogg/goer-agent-sdk"
 	"github.com/Mrfogg/goer-agent-sdk/ctxkey"
 
 	"github.com/glebarez/sqlite"
@@ -209,6 +210,132 @@ func TestWriteToolRecordsAndRewrites(t *testing.T) {
 	}
 	if _, ok := same.ModelData["replaced"]; ok {
 		t.Fatalf("expected an unchanged rewrite to replace nothing, got %v", same.ModelData)
+	}
+}
+
+// The product side of every memory change travels on ToolResult.Events, so a UI
+// can show what the agent just did without the model ever seeing it.
+func TestMemoryToolsEmitProductEvents(t *testing.T) {
+	module := newTestModule(t, 7, WithMerger(MergerFunc(func(context.Context, []string) (Merged, error) {
+		return Merged{
+			Facts:  []string{"用户偏好用中文回复", "用户希望用中文回复"},
+			Merged: "用户偏好用中文回复",
+		}, nil
+	})))
+	ctx := context.Background()
+
+	saved, err := (&writeTool{module: module}).Execute(ctx, map[string]any{"content": "用户偏好用中文回复"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	assertMemoryEvent(t, saved, "saved", saved.ModelData["memory_id"].(string))
+	if saved.Events[0].Data["content"] != "用户偏好用中文回复" {
+		t.Fatalf("expected the saved content in the event, got %v", saved.Events[0].Data)
+	}
+
+	rewritten, err := (&writeTool{module: module}).Execute(ctx, map[string]any{
+		"memory_id": saved.ModelData["memory_id"],
+		"content":   "用户偏好用中文回复，并且回答简短",
+	})
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	assertMemoryEvent(t, rewritten, "rewritten", saved.ModelData["memory_id"].(string))
+	if rewritten.Events[0].Data["replaced"] != "用户偏好用中文回复" {
+		t.Fatalf("expected the replaced text in the event, got %v", rewritten.Events[0].Data)
+	}
+
+	second := addMemory(t, module, "用户希望用中文回复")
+	merged, err := (&mergeTool{module: module}).Execute(ctx, map[string]any{
+		"memory_ids": []any{saved.ModelData["memory_id"], second.ID},
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	assertMemoryEvent(t, merged, "merged", merged.ModelData["memory_id"].(string))
+	if from, ok := merged.Events[0].Data["merged_from"].([]string); !ok || len(from) != 2 {
+		t.Fatalf("expected the folded ids in the event, got %v", merged.Events[0].Data)
+	}
+
+	deleted, err := (&forgetTool{module: module}).Execute(
+		contextWithUserMessages("这条别记了，请忘掉它"),
+		map[string]any{"memory_id": merged.ModelData["memory_id"], "user_quote": "请忘掉它"},
+	)
+	if err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	assertMemoryEvent(t, deleted, "deleted", merged.ModelData["memory_id"].(string))
+}
+
+func assertMemoryEvent(t *testing.T, result base.ToolResult, action, memoryID string) {
+	t.Helper()
+
+	if !result.Success {
+		t.Fatalf("expected the call to succeed, got %q", result.Error)
+	}
+	if len(result.Events) != 1 {
+		t.Fatalf("expected exactly one product event, got %+v", result.Events)
+	}
+	if result.Events[0].Type != MemoryEventType {
+		t.Fatalf("event type = %q, want %q", result.Events[0].Type, MemoryEventType)
+	}
+	if got := result.Events[0].Data["action"]; got != action {
+		t.Fatalf("event action = %v, want %q", got, action)
+	}
+	if got := result.Events[0].Data["memory_id"]; got != memoryID {
+		t.Fatalf("event memory_id = %v, want %q", got, memoryID)
+	}
+}
+
+// A refusal travels on the same channel as a change: without the event a
+// blocked call is invisible on the product side, and "the model tried to delete
+// it and was stopped" is exactly what a UI has to be able to show.
+func TestRefusedMemoryCallsEmitAProductEvent(t *testing.T) {
+	module := newTestModule(t, 7)
+	record := addMemory(t, module, "用户偏好用中文回复")
+
+	// No evidence in the conversation, so nothing may be deleted.
+	refused, err := (&forgetTool{module: module}).Execute(context.Background(), map[string]any{
+		"memory_id":  record.ID,
+		"user_quote": "请忘掉这条记忆",
+	})
+	if err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	assertMemoryRejection(t, refused, record.ID)
+
+	secret, err := (&writeTool{module: module}).Execute(context.Background(), map[string]any{
+		"content": "用户的密码是 hunter2secret",
+	})
+	if err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	assertMemoryRejection(t, secret, "")
+}
+
+func assertMemoryRejection(t *testing.T, result base.ToolResult, memoryID string) {
+	t.Helper()
+
+	if result.Success {
+		t.Fatal("expected the call to be refused")
+	}
+	if len(result.Events) != 1 {
+		t.Fatalf("expected exactly one product event, got %+v", result.Events)
+	}
+	event := result.Events[0]
+	if event.Type != MemoryEventType {
+		t.Fatalf("event type = %q, want %q", event.Type, MemoryEventType)
+	}
+	if event.Data["action"] != memoryActionRejected {
+		t.Fatalf("event action = %v, want %q", event.Data["action"], memoryActionRejected)
+	}
+	// The product side is told the same reason the model is, so the UI can say
+	// why the action did not happen.
+	if event.Data["error"] != result.Error {
+		t.Fatalf("event error = %v, want %q", event.Data["error"], result.Error)
+	}
+	if memoryID != "" && event.Data["memory_id"] != memoryID {
+		t.Fatalf("event memory_id = %v, want %q", event.Data["memory_id"], memoryID)
 	}
 }
 
