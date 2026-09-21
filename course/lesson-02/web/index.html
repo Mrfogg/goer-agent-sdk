@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第二课 · 让 Agent 记住你</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="badge">lesson 02</span>
+    <div>
+      <h1>让 Agent 记住你</h1>
+      <p>记忆不在对话里：清空历史之后它还认得你，因为记忆存在对话之外</p>
+    </div>
+  </div>
+  <div class="actions">
+    <label class="switch">
+      <input type="checkbox" id="show-reasoning" checked>
+      显示思考过程
+    </label>
+    <button id="reset" class="ghost" type="button">新会话（保留记忆）</button>
+    <button id="clear-memories" class="ghost" type="button">清空记忆</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="chat">
+    <div id="messages" class="messages">
+      <div class="empty">
+        <h2>先让它认识你</h2>
+        <p>比如「我是做财务分析的，以后回答都用中文，尽量简短」——模型会调用 <code>memory_write</code> 把这件事写进记忆库。</p>
+        <p>然后点右上角<b>「新会话（保留记忆）」</b>，再问一句「我是做什么的？」。历史已经清空，但它仍然答得出来。</p>
+      </div>
+    </div>
+
+    <form id="composer" class="composer">
+      <textarea id="input" rows="1" placeholder="说点什么…"></textarea>
+      <button id="send" type="submit">发送</button>
+      <button id="stop" class="danger" type="button" hidden>停止</button>
+    </form>
+    <p class="hint">回车发送 · Shift + 回车换行 · 运行中点「停止」会中断这一轮 run</p>
+  </section>
+
+  <aside class="panel">
+    <h2>
+      记忆库
+      <span id="memory-count" class="count">0 条</span>
+    </h2>
+    <p class="muted">
+      存在 <code id="memory-db">memories.db</code> 里（SQLite），进程重启也还在。
+      <b>「新会话」不会动它</b>，只有「清空记忆」才会。
+    </p>
+    <div id="memories" class="memories">
+      <div class="mem-empty">还没有任何记忆</div>
+    </div>
+
+    <h2 class="section-title">这一轮发生了什么</h2>
+    <ol id="steps" class="steps">
+      <li data-step="request"><b>1</b> 发送请求 <span>历史 + 记忆一起进 system prompt</span></li>
+      <li data-step="model"><b>2</b> 模型思考 <span>reasoning / content</span></li>
+      <li data-step="tool"><b>3</b> 调用工具 <span>记忆的读写删都在这</span></li>
+      <li data-step="deliver"><b>4</b> end tool 交付 <span>finish 成功 → run 结束</span></li>
+    </ol>
+
+    <div class="note">
+      <h3>看这三点</h3>
+      <ul>
+        <li><b>历史 ≠ 记忆。</b>每轮开头那条 <code>context</code> 事件报两个数：带上的历史条数、记忆库条数。点完「新会话」再问一次，历史是 0，记忆还在。</li>
+        <li><b>没调用就没记住。</b>记忆只有 <code>memory_write</code> 一个写入口。模型这一轮没调它，说过的任何话下一轮都不存在。</li>
+        <li><b>删不删不是模型说了算。</b><code>memory_forget</code> 要求模型引用用户原话，服务端会核对——你没说过「忘掉」，它就删不掉。</li>
+      </ul>
+    </div>
+
+    <h2 class="raw-title">
+      原始 SSE 事件
+      <button id="toggle-raw" class="ghost small" type="button">显示</button>
+    </h2>
+    <pre id="raw" class="raw" hidden></pre>
+  </aside>
+
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

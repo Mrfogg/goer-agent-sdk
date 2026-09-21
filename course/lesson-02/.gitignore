@@ -1,0 +1,7 @@
+# go build 会在当前目录生成一个和目录同名的可执行文件
+/lesson-02
+
+# 本课的记忆库（SQLite），跑起来就会生成
+/memories.db
+/memories.db-shm
+/memories.db-wal
