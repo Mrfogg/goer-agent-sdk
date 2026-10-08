@@ -18,7 +18,17 @@ go.work.sum
 *.swp
 *~
 
+# AI/editor tooling
+.claude/
+.trae/
+
 # Local environment
 .env
 .env.*
 !.env.example
+
+# Local databases: memorykit, examples and courses write SQLite files at runtime
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
