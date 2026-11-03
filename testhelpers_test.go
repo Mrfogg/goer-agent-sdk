@@ -167,6 +167,27 @@ func sseReasoning(t *testing.T, reasoning string) string {
 	return "data: " + mustJSON(t, chunk) + "\n\n" + sseUsage(t, testPromptTokens, testCompletionTokens)
 }
 
+// sseContentDeltas scripts a text reply split across several content chunks, so a
+// test can assert that every message carries only its own fragment.
+func sseContentDeltas(t *testing.T, deltas ...string) string {
+	t.Helper()
+	var b strings.Builder
+	for i, delta := range deltas {
+		role := ""
+		if i == 0 {
+			role = "assistant"
+		}
+		chunk := map[string]any{
+			"choices": []any{
+				map[string]any{"index": 0, "delta": map[string]any{"role": role, "content": delta}},
+			},
+		}
+		b.WriteString("data: " + mustJSON(t, chunk) + "\n\n")
+	}
+	b.WriteString(sseUsage(t, testPromptTokens, testCompletionTokens))
+	return b.String()
+}
+
 // sseUsage scripts the final stream chunk that carries token usage, which is what
 // providers send when the request asks for stream_options.include_usage.
 func sseUsage(t *testing.T, promptTokens, completionTokens int) string {

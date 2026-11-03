@@ -48,10 +48,11 @@ type ToolEventEmitter func(Msg)
 
 const (
 	// MsgTypeReasoning and MsgTypeContent are the only two message types the
-	// runtime emits. They carry the streamed deltas of an assistant turn, kept
+	// runtime emits. They carry the streamed text of an assistant turn, kept
 	// apart so a frontend can render thinking separately: MsgTypeReasoning is the
-	// model's reasoning (thinking) text, MsgTypeContent is the answer text. Both
-	// carry the text accumulated so far, not just the last fragment.
+	// model's reasoning (thinking) text, MsgTypeContent is the answer text. In
+	// streaming mode each message carries only the newest fragment, so a consumer
+	// appends them to build the full text.
 	MsgTypeReasoning = "reasoning"
 	MsgTypeContent   = "content"
 

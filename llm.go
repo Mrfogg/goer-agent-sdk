@@ -188,8 +188,8 @@ func (a *BaseAgent) callLLMStream(ctx context.Context, client *openai.Client, re
 		}
 		if choice.Delta.Content != "" {
 			response.Message.Content += choice.Delta.Content
-			if onContent != nil && strings.TrimSpace(response.Message.Content) != "" {
-				onContent(response.Message.Content)
+			if onContent != nil {
+				onContent(choice.Delta.Content)
 			}
 		}
 		if choice.Delta.Refusal != "" {
@@ -197,8 +197,8 @@ func (a *BaseAgent) callLLMStream(ctx context.Context, client *openai.Client, re
 		}
 		if choice.Delta.ReasoningContent != "" {
 			response.Message.ReasoningContent += choice.Delta.ReasoningContent
-			if onReasoning != nil && strings.TrimSpace(response.Message.ReasoningContent) != "" {
-				onReasoning(response.Message.ReasoningContent)
+			if onReasoning != nil {
+				onReasoning(choice.Delta.ReasoningContent)
 			}
 		}
 		if choice.Delta.FunctionCall != nil {

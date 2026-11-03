@@ -34,8 +34,10 @@ type RunResult struct {
 //
 // The returned channel carries the whole output of the run: MsgTypeReasoning
 // messages for the model's thinking, MsgTypeContent messages for the answer
-// text, and a final MsgTypeContent message carrying the end tool's answer. The
-// channel is closed when the run ends.
+// text, and a final MsgTypeContent message carrying the end tool's answer. In
+// streaming mode each text message carries only the newest fragment, so a
+// consumer appends them to build the full text. The channel is closed when the
+// run ends.
 //
 // The error is about the call, not the run: the only case today is calling Run
 // while another run is still active, because a BaseAgent owns per-run state and

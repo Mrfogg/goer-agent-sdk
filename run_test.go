@@ -42,6 +42,35 @@ func TestRunFinishesThroughEndTool(t *testing.T) {
 	}
 }
 
+func TestStreamingEmitsFragmentsNotCumulativeText(t *testing.T) {
+	llm := newFakeLLM(
+		// First reply is text-only, so the run needs a second call to finish.
+		sseContentDeltas(t, "Hel", "lo, ", "world"),
+		sseToolCalls(t, scriptedToolCall{id: "call_1", name: "finish", arguments: "{}"}),
+	)
+	server := llm.start(t)
+	agent := startAgent(t, server)
+
+	msgs, result := collectRun(t, agent, "hi")
+	if result.Err != nil {
+		t.Fatalf("run failed: %v", result.Err)
+	}
+
+	var contents []string
+	for _, msg := range messagesOfType(msgs, MsgTypeContent) {
+		contents = append(contents, msg.Content)
+	}
+	want := []string{"Hel", "lo, ", "world", "final answer"}
+	if len(contents) != len(want) {
+		t.Fatalf("content messages = %q, want %q", contents, want)
+	}
+	for i := range want {
+		if contents[i] != want[i] {
+			t.Fatalf("content[%d] = %q, want %q (all: %q)", i, contents[i], want[i], contents)
+		}
+	}
+}
+
 func TestNonStreamingModeEmitsOneMessagePerKind(t *testing.T) {
 	llm := newFakeLLMWithJSON(
 		// First reply is text-only, so the runtime rejects it and retries.

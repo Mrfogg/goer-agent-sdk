@@ -342,8 +342,8 @@ run 期间只有三种消息：
 
 | `msg.Type` | 含义 |
 | --- | --- |
-| `reasoning` | 模型的思考文本，流式累积 |
-| `content` | 回答正文，最后一条一定是 end tool 的答案 |
+| `reasoning` | 模型的思考文本，流式增量片段，直接追加拼接 |
+| `content` | 回答正文，流式增量片段，直接追加拼接；最后一条一定是 end tool 的答案 |
 | `usage` | 单次 LLM 调用的 token 用量，在 `msg.Data` 里 |
 
 没有心跳、没有开始/结束标记——channel 关闭就是 run 结束。结局只在 `Result()` 里：成功看 `Answer`、

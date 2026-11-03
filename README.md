@@ -359,8 +359,8 @@ A run emits exactly three message types:
 
 | `msg.Type` | Meaning |
 | --- | --- |
-| `reasoning` | the model's thinking text, streamed |
-| `content` | the answer text; the last one is always the end tool's answer |
+| `reasoning` | the model's thinking text, streamed as fragments to append |
+| `content` | the answer text, streamed as fragments to append; the last one is always the end tool's answer |
 | `usage` | token usage of one LLM call, in `msg.Data` |
 
 There is no heartbeat, no start marker and no terminal event — the channel closing is the end of the
